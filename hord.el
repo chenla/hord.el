@@ -404,6 +404,7 @@
     (define-key map (kbd "t")   #'hord-list-type)
     (define-key map (kbd "g")   #'hord-refresh)
     (define-key map (kbd "q")   #'quit-window)
+    (define-key map (kbd "?")   #'hord-help)
     (define-key map (kbd "TAB") #'forward-button)
     (define-key map (kbd "<backtab>") #'backward-button)
     map)
@@ -425,6 +426,7 @@
     (define-key map (kbd "s")   #'hord-find)
     (define-key map (kbd "t")   #'hord-list-type)
     (define-key map (kbd "q")   #'quit-window)
+    (define-key map (kbd "?")   #'hord-help)
     map)
   "Keymap for `hord-list-mode'.")
 
@@ -462,6 +464,17 @@
                            (substring created 0 16)
                          created)))))
      entities)))
+
+;; ── Help ──────────────────────────────────────────────────
+
+(defun hord-help ()
+  "Show hord keybindings."
+  (interactive)
+  (message (substitute-command-keys
+            (concat
+             "RET follow  TAB/S-TAB next/prev link  "
+             "b back  e edit  g refresh  "
+             "s search  t type  l list  q quit"))))
 
 ;; ── Interactive commands ──────────────────────────────────
 
