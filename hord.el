@@ -267,8 +267,9 @@
   "Read metadata from org FILEPATH.  Returns alist of property values."
   (when (and filepath (file-exists-p filepath))
     (with-temp-buffer
-      (insert-file-contents filepath nil 0 2000) ; first 2k is enough
+      (insert-file-contents filepath)
       (let (result)
+        ;; Main PROPERTIES drawer
         (goto-char (point-min))
         (when (re-search-forward ":PROPERTIES:" nil t)
           (let ((end (save-excursion
@@ -279,15 +280,52 @@
                 (push (cons (match-string 1)
                             (string-trim (match-string 2)))
                       result)))))
-        ;; Also grab body text (after Relations and Notes sections)
+        ;; Bibliographic Data properties
+        (goto-char (point-min))
+        (when (re-search-forward "^\\*\\* Bibliographic Data" nil t)
+          (when (re-search-forward ":PROPERTIES:" nil t)
+            (let ((end (save-excursion
+                         (re-search-forward ":END:" nil t))))
+              (when end
+                (let (bib-fields)
+                  (while (re-search-forward
+                          ":\\([A-Z_-]+\\):\\s-+\\(.+\\)" end t)
+                    (push (cons (match-string 1)
+                                (string-trim (match-string 2)))
+                          bib-fields))
+                  (push (cons "BIB-DATA" (nreverse bib-fields)) result))))))
+        ;; Notes section body
         (goto-char (point-min))
         (when (re-search-forward "^\\*\\* Notes" nil t)
           (forward-line 1)
-          (let ((body-start (point)))
-            (push (cons "BODY" (string-trim
-                                (buffer-substring-no-properties
-                                 body-start (point-max))))
-                  result)))
+          (let ((body-start (point))
+                (body-end (or (save-excursion
+                                (re-search-forward "^\\*+ " nil t)
+                                (line-beginning-position))
+                              (point-max))))
+            (let ((body (string-trim
+                         (buffer-substring-no-properties
+                          body-start body-end))))
+              (unless (string-empty-p body)
+                (push (cons "BODY" body) result)))))
+        ;; References section (** or * level)
+        (goto-char (point-min))
+        (when (re-search-forward "^\\*+ References" nil t)
+          (forward-line 1)
+          (let ((ref-start (point))
+                (ref-end (or (save-excursion
+                               (re-search-forward "^\\*\\* " nil t)
+                               (line-beginning-position))
+                             (point-max))))
+            (let ((refs (string-trim
+                         (buffer-substring-no-properties
+                          ref-start ref-end))))
+              ;; Strip bibliography: lines
+              (setq refs (replace-regexp-in-string
+                          "^\\s*bibliography:.*\n?" "" refs))
+              (setq refs (string-trim refs))
+              (unless (string-empty-p refs)
+                (push (cons "REFS" refs) result)))))
         result))))
 
 ;; ── History ───────────────────────────────────────────────
@@ -363,13 +401,36 @@
                   "\n")))
       (insert "\n"))
 
+    ;; Bibliographic Data (for work cards)
+    (let ((bib-data (cdr (assoc "BIB-DATA" meta))))
+      (when bib-data
+        (insert (propertize "── Bibliographic Data " 'face 'hord-section-header)
+                (propertize (make-string 34 ?─) 'face 'hord-section-header)
+                "\n")
+        (dolist (field bib-data)
+          (let ((key (car field))
+                (val (cdr field)))
+            (insert "  "
+                    (propertize (format "%-12s" (concat key ":"))
+                                'face 'hord-metadata-key)
+                    " " val "\n")))
+        (insert "\n")))
+
     ;; Notes body
     (let ((body (cdr (assoc "BODY" meta))))
       (when (and body (not (string-empty-p body)))
         (insert (propertize "── Notes " 'face 'hord-section-header)
                 (propertize (make-string 47 ?─) 'face 'hord-section-header)
                 "\n")
-        (insert body "\n")))
+        (insert body "\n\n")))
+
+    ;; References
+    (let ((refs (cdr (assoc "REFS" meta))))
+      (when refs
+        (insert (propertize "── References " 'face 'hord-section-header)
+                (propertize (make-string 42 ?─) 'face 'hord-section-header)
+                "\n")
+        (insert refs "\n")))
 
     (goto-char (point-min))))
 
