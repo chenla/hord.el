@@ -577,10 +577,10 @@ Optional TYPE-FILTER limits to a specific type."
 ;; ── Keybinding ────────────────────────────────────────────
 
 ;;;###autoload
-(global-set-key (kbd "C-c h f") #'hord-find)
+(global-set-key (kbd "C-c W f") #'hord-find)
 
 ;;;###autoload
-(global-set-key (kbd "C-c h l") #'hord-list)
+(global-set-key (kbd "C-c W l") #'hord-list)
 
 (provide 'hord)
 ;;; hord.el ends here
