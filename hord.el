@@ -488,12 +488,26 @@
 
 ;; ── List view mode ────────────────────────────────────────
 
+(defvar-local hord-list-filter ""
+  "Current filter string for the hord list view.
+Filter syntax (space-separated tokens):
+  @type    — show only this type (e.g. @con, @per, @cap)
+  text     — match title (case-insensitive)
+  +dir     — match directory (e.g. +capture, +content)
+Multiple tokens are ANDed together.")
+
+(defvar-local hord-list-filter-active nil
+  "State of filter editing: nil, :live, or :non-interactive.")
+
 (defvar hord-list-mode-map
   (let ((map (make-sparse-keymap)))
     (set-keymap-parent map tabulated-list-mode-map)
     (define-key map (kbd "RET") #'hord-list-open)
-    (define-key map (kbd "s")   #'hord-find)
+    (define-key map (kbd "s")   #'hord-list-live-filter)
+    (define-key map (kbd "S")   #'hord-list-set-filter)
+    (define-key map (kbd "c")   #'hord-list-clear-filter)
     (define-key map (kbd "t")   #'hord-list-type)
+    (define-key map (kbd "g")   #'hord-list-refresh)
     (define-key map (kbd "q")   #'quit-window)
     (define-key map (kbd "?")   #'hord-help)
     map)
@@ -501,50 +515,169 @@
 
 (define-derived-mode hord-list-mode tabulated-list-mode "Hord-List"
   "Major mode for browsing Hoard entities.
+
+Filter with `s' (live) or `S' (set). Clear with `c'.
+Filter syntax: @type +dir text (space-separated, ANDed).
+
+Examples:
+  @con              — show concepts only
+  @per alexander    — persons matching 'alexander'
+  +capture          — capture cards only
+  braudel           — anything with 'braudel' in title
+
 \\{hord-list-mode-map}"
   (setq tabulated-list-format
         [("Type" 12 t)
          ("Title" 55 t)
-         ("Created" 20 t)])
+         ("Dir" 10 t)])
   (setq truncate-lines t)
   (setq tabulated-list-sort-key '("Title" . nil))
   (setq tabulated-list-padding 1)
   (tabulated-list-init-header))
 
-(defun hord--list-entries (&optional type-filter)
-  "Build tabulated-list entries, optionally filtered by TYPE-FILTER."
-  (let ((entities (hord--all-entities)))
-    (when type-filter
-      (setq entities (seq-filter
-                      (lambda (e) (string= (nth 2 e) type-filter))
-                      entities)))
+(defun hord--parse-filter (filter-str)
+  "Parse FILTER-STR into a plist of filter components.
+Returns (:types (list) :dirs (list) :terms (list))."
+  (let (types dirs terms)
+    (dolist (token (split-string (string-trim filter-str)))
+      (cond
+       ((string-prefix-p "@" token)
+        (push (substring token 1) types))
+       ((string-prefix-p "+" token)
+        (push (substring token 1) dirs))
+       ((not (string-empty-p token))
+        (push (downcase token) terms))))
+    (list :types (nreverse types)
+          :dirs (nreverse dirs)
+          :terms (nreverse terms))))
+
+(defun hord--entity-matches-filter (entity filter)
+  "Test if ENTITY (uuid title type path) matches parsed FILTER."
+  (let ((title (downcase (nth 1 entity)))
+        (type (nth 2 entity))
+        (path (nth 3 entity))
+        (types (plist-get filter :types))
+        (dirs (plist-get filter :dirs))
+        (terms (plist-get filter :terms)))
+    (and
+     ;; Type filter: match short name or full vocab id
+     (or (null types)
+         (seq-some (lambda (t)
+                     (or (string= type (concat "wh:" t))
+                         (string= type t)))
+                   types))
+     ;; Directory filter
+     (or (null dirs)
+         (seq-some (lambda (d)
+                     (string-match-p (regexp-quote d) path))
+                   dirs))
+     ;; Term filter: all terms must match title
+     (or (null terms)
+         (seq-every-p (lambda (term)
+                        (string-match-p (regexp-quote term) title))
+                      terms)))))
+
+(defun hord--list-entries-filtered (filter-str)
+  "Build tabulated-list entries matching FILTER-STR.
+Uses in-memory data only — no per-file reads."
+  (let* ((entities (hord--all-entities))
+         (filter (hord--parse-filter filter-str))
+         (filtered (if (string-empty-p (string-trim filter-str))
+                       entities
+                     (seq-filter
+                      (lambda (e) (hord--entity-matches-filter e filter))
+                      entities))))
     (mapcar
      (lambda (e)
        (let* ((uuid (nth 0 e))
               (title (nth 1 e))
               (type (nth 2 e))
               (path (nth 3 e))
-              (meta (hord--read-org-metadata
-                     (expand-file-name path (expand-file-name hord-root))))
-              (created (or (cdr (assoc "CREATED" meta)) "")))
+              (dir (if (string-match "^\\([^/]+\\)/" path)
+                       (match-string 1 path)
+                     "")))
          (list uuid
                (vector (hord--type-label type)
                        (hord--truncate title 55)
-                       (if (> (length created) 16)
-                           (substring created 0 16)
-                         created)))))
-     entities)))
+                       dir))))
+     filtered)))
+
+;; ── Live filter (elfeed-style) ────────────────────────────
+
+(defun hord-list-live-filter ()
+  "Edit the hord list filter with live preview.
+Updates the list in real-time as you type."
+  (interactive)
+  (hord--ensure-loaded)
+  (unwind-protect
+      (let ((hord-list-filter-active :live))
+        (setq hord-list-filter
+              (read-from-minibuffer
+               "Filter (@type +dir text): "
+               hord-list-filter)))
+    (hord--list-update)))
+
+(defun hord-list-set-filter ()
+  "Set the hord list filter without live preview."
+  (interactive)
+  (setq hord-list-filter
+        (read-from-minibuffer
+         "Filter (@type +dir text): "
+         hord-list-filter))
+  (hord--list-update))
+
+(defun hord-list-clear-filter ()
+  "Clear the current filter and show all entities."
+  (interactive)
+  (setq hord-list-filter "")
+  (hord--list-update))
+
+(defun hord-list-refresh ()
+  "Reload data and refresh the list."
+  (interactive)
+  (hord--load (expand-file-name hord-root))
+  (hord--list-update))
+
+(defun hord--list-update ()
+  "Re-render the list with the current filter."
+  (when (derived-mode-p 'hord-list-mode)
+    (let ((pos (point)))
+      (setq tabulated-list-entries
+            (hord--list-entries-filtered hord-list-filter))
+      (tabulated-list-print)
+      (goto-char (min pos (point-max)))
+      ;; Show count in header
+      (setq header-line-format
+            (if (string-empty-p (string-trim hord-list-filter))
+                (format " %d entities" (length tabulated-list-entries))
+              (format " %d matching: %s"
+                      (length tabulated-list-entries)
+                      hord-list-filter))))))
+
+(defun hord--list-live-update ()
+  "Update the list from the minibuffer contents (live filter)."
+  (when (eq hord-list-filter-active :live)
+    (let ((input (minibuffer-contents-no-properties)))
+      (when (get-buffer "*hord-list*")
+        (with-current-buffer "*hord-list*"
+          (setq hord-list-filter input)
+          (hord--list-update))))))
+
+(defun hord--list-minibuffer-setup ()
+  "Set up minibuffer for live filtering."
+  (when (eq hord-list-filter-active :live)
+    (add-hook 'post-command-hook #'hord--list-live-update nil :local)))
+
+(add-hook 'minibuffer-setup-hook #'hord--list-minibuffer-setup)
 
 ;; ── Help ──────────────────────────────────────────────────
 
 (defun hord-help ()
   "Show hord keybindings."
   (interactive)
-  (message (substitute-command-keys
-            (concat
-             "RET follow  TAB/S-TAB next/prev link  "
-             "b back  e edit  g refresh  "
-             "s search  t type  l list  q quit"))))
+  (if (derived-mode-p 'hord-list-mode)
+      (message "RET open  s live-filter  S set-filter  c clear  t type  g refresh  q quit")
+    (message "RET follow  TAB/S-TAB links  b back  e edit  g refresh  s search  t type  l list  q quit")))
 
 ;; ── Interactive commands ──────────────────────────────────
 
@@ -583,30 +716,32 @@
     (pop-to-buffer-same-window buf)))
 
 ;;;###autoload
-(defun hord-list (&optional type-filter)
-  "Show all hord entities in a tabulated list.
-Optional TYPE-FILTER limits to a specific type."
+(defun hord-list (&optional initial-filter)
+  "Show all hord entities in a filterable list.
+Optional INITIAL-FILTER sets the starting filter string."
   (interactive)
   (hord--ensure-loaded)
   (let ((buf (get-buffer-create "*hord-list*")))
     (with-current-buffer buf
       (hord-list-mode)
-      (setq tabulated-list-entries (hord--list-entries type-filter))
-      (tabulated-list-print))
+      (setq hord-list-filter (or initial-filter ""))
+      (hord--list-update))
     (pop-to-buffer-same-window buf)))
 
 (defun hord-list-type ()
-  "List cards filtered by type."
+  "Set filter to a specific type via completing-read."
   (interactive)
   (hord--ensure-loaded)
   (let* ((types (delete-dups
                  (mapcar (lambda (e) (nth 2 e)) (hord--all-entities))))
-         (labels (mapcar (lambda (t)
-                           (cons (format "%s (%s)" (hord--type-label t) t) t))
+         (labels (mapcar (lambda (ty)
+                           (cons (format "%s (%s)" (hord--type-label ty) ty)
+                                 (replace-regexp-in-string "^wh:" "" ty)))
                          (sort types #'string<)))
          (choice (completing-read "Type: " labels nil t))
-         (type-id (cdr (assoc choice labels))))
-    (hord-list type-id)))
+         (short (cdr (assoc choice labels))))
+    (setq hord-list-filter (concat "@" short))
+    (hord--list-update)))
 
 (defun hord-list-open ()
   "Open the card at point in hord-list-mode."
