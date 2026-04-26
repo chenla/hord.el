@@ -818,6 +818,164 @@ Optional INITIAL-FILTER sets the starting filter string."
   (hord--ensure-loaded)
   (message "Hord reloaded"))
 
+;; ── RT suggestion ─────────────────────────────────────────
+
+(defun hord--current-card-uuid ()
+  "Get the UUID of the card in the current org buffer.
+Searches for :ID: in the first PROPERTIES drawer."
+  (save-excursion
+    (goto-char (point-min))
+    (when (re-search-forward ":ID:\\s-+\\([0-9a-f-]+\\)" nil t)
+      (match-string-no-properties 1))))
+
+(defun hord--current-card-words ()
+  "Extract searchable words from the current org buffer.
+Uses the title, relations labels, and all body text."
+  (save-excursion
+    (let (words)
+      ;; Title
+      (goto-char (point-min))
+      (when (re-search-forward "^#\\+TITLE:\\s-+\\(.+\\)" nil t)
+        (push (match-string-no-properties 1) words))
+      ;; Everything after the PROPERTIES :END: — body, relations, notes, refs
+      (goto-char (point-min))
+      (when (re-search-forward "^  :END:" nil t)
+        (forward-line 1)
+        (push (buffer-substring-no-properties (point) (point-max)) words))
+      (downcase (string-join (nreverse words) " ")))))
+
+(defvar hord--stopwords
+  '("from" "with" "that" "this" "into" "have" "been" "were"
+    "their" "about" "which" "would" "there" "when" "what"
+    "some" "them" "than" "each" "make" "more" "also" "will"
+    "only" "over" "such" "after" "other" "most" "very" "just"
+    "where" "before" "between" "through" "could" "should"
+    "being" "first" "under" "based" "does" "using" "used"
+    "these" "those" "many" "well" "much" "like" "case"
+    "part" "work" "type" "note" "term" "essay" "book"
+    "volume" "edition" "press" "university" "review"
+    "history" "journal" "building" "nature" "order"
+    "wikipedia" "english")
+  "Words to skip when scoring RT candidates.")
+
+(defun hord--score-candidate (candidate-title card-words)
+  "Score how well CANDIDATE-TITLE matches CARD-WORDS.
+Returns weighted score: title words in card text."
+  (let ((title-words (split-string (downcase candidate-title) "[^a-z0-9]+" t))
+        (score 0)
+        (significant-words 0))
+    (dolist (w title-words)
+      (when (and (> (length w) 3)
+                 (not (member w hord--stopwords)))
+        (setq significant-words (1+ significant-words))
+        (when (string-match-p (regexp-quote w) card-words)
+          (setq score (1+ score)))))
+    ;; Require at least half the significant words to match
+    (if (and (> significant-words 0)
+             (>= (/ (* score 100) significant-words) 50))
+        score
+      0)))
+
+(defun hord--existing-relations (uuid)
+  "Return list of UUIDs already linked from UUID."
+  (let ((quads (gethash uuid hord--quads)))
+    (mapcar #'hord-quad-object
+            (seq-filter (lambda (q)
+                          (string-match-p "^[0-9a-f]\\{8\\}-"
+                                          (hord-quad-object q)))
+                        quads))))
+
+(defun hord--suggest-rt-candidates (uuid &optional limit)
+  "Return candidate (uuid . title) pairs for RT links from UUID.
+Scores all entities by word overlap with the card's content.
+Excludes self and already-linked entities.
+Returns at most LIMIT candidates (default 30), sorted by score."
+  (hord--ensure-loaded)
+  (let* ((card-words (hord--current-card-words))
+         (existing (hord--existing-relations uuid))
+         (candidates nil))
+    (maphash
+     (lambda (cand-uuid cand-title)
+       (unless (or (string= cand-uuid uuid)
+                   (member cand-uuid existing))
+         (let ((score (hord--score-candidate cand-title card-words)))
+           (when (>= score 2)
+             (push (list score cand-uuid cand-title) candidates)))))
+     hord--titles)
+    ;; Sort by score descending, take top N
+    (let ((sorted (seq-take
+                   (sort candidates (lambda (a b) (> (car a) (car b))))
+                   (or limit 30))))
+      (mapcar #'cdr sorted))))
+
+(defun hord-suggest-rt ()
+  "Suggest and insert RT links for the current org card.
+Scans the card's title and body against all hord entities,
+presents scored candidates via completing-read (multiple
+selection), and inserts the chosen RT links into the
+Relations section.
+
+Run this while editing a card in org-mode."
+  (interactive)
+  (hord--ensure-loaded)
+  (let ((uuid (hord--current-card-uuid)))
+    (unless uuid
+      (error "No :ID: found in this buffer — not a hord card?"))
+    (let* ((candidates (hord--suggest-rt-candidates uuid))
+           (labels (mapcar
+                    (lambda (c)
+                      (let* ((cand-uuid (nth 0 c))
+                             (cand-title (nth 1 c))
+                             (cand-type (or (gethash cand-uuid hord--types) "")))
+                        (cons (format "%-12s %s"
+                                      (hord--type-label cand-type)
+                                      cand-title)
+                              cand-uuid)))
+                    candidates)))
+      (if (null labels)
+          (message "No RT candidates found for this card")
+        ;; Multiple selection loop
+        (let ((chosen nil)
+              (remaining labels))
+          (while (and remaining
+                      (let* ((choice (completing-read
+                                      (format "RT [%d selected, RET to finish]: "
+                                              (length chosen))
+                                      remaining nil nil))
+                             (pair (assoc choice remaining)))
+                        (if (and pair (not (string-empty-p choice)))
+                            (progn
+                              (push pair chosen)
+                              (setq remaining (delete pair remaining))
+                              t)
+                          nil))))
+          (when chosen
+            ;; Insert RT links into Relations section
+            (save-excursion
+              (goto-char (point-min))
+              (if (re-search-forward "^\\*\\* Relations" nil t)
+                  (progn
+                    (end-of-line)
+                    (dolist (c (nreverse chosen))
+                      (insert (format "\n   - RT :: [[id:%s][%s]]"
+                                      (cdr c)
+                                      ;; Extract title from the label
+                                      (replace-regexp-in-string
+                                       "^[^ ]+ +" "" (car c))))))
+                ;; No Relations section — create one
+                (goto-char (point-min))
+                (when (re-search-forward "^\\*\\* Notes" nil t)
+                  (beginning-of-line)
+                  (insert "** Relations\n")
+                  (dolist (c (nreverse chosen))
+                    (insert (format "   - RT :: [[id:%s][%s]]\n"
+                                    (cdr c)
+                                    (replace-regexp-in-string
+                                     "^[^ ]+ +" "" (car c)))))
+                  (insert "\n"))))
+            (save-buffer)
+            (message "Added %d RT links" (length chosen))))))))
+
 ;; ── Keybinding ────────────────────────────────────────────
 
 ;;;###autoload
@@ -825,6 +983,9 @@ Optional INITIAL-FILTER sets the starting filter string."
 
 ;;;###autoload
 (global-set-key (kbd "C-c W l") #'hord-list)
+
+;;;###autoload
+(global-set-key (kbd "C-c W r") #'hord-suggest-rt)
 
 (provide 'hord)
 ;;; hord.el ends here
