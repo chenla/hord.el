@@ -496,7 +496,7 @@ Filter syntax (space-separated tokens):
   +dir     — match directory (e.g. +capture, +content)
 Multiple tokens are ANDed together.")
 
-(defvar-local hord-list-filter-active nil
+(defvar hord-list-filter-active nil
   "State of filter editing: nil, :live, or :non-interactive.")
 
 (defvar hord-list-mode-map
@@ -609,13 +609,15 @@ Uses in-memory data only — no per-file reads."
 Updates the list in real-time as you type."
   (interactive)
   (hord--ensure-loaded)
+  (setq hord-list-filter-active :live)
   (unwind-protect
-      (let ((hord-list-filter-active :live))
-        (setq hord-list-filter
-              (read-from-minibuffer
-               "Filter (@type +dir text): "
-               hord-list-filter)))
-    (hord--list-update)))
+      (let ((result (read-from-minibuffer
+                     "Filter (@type +dir text): "
+                     hord-list-filter)))
+        (with-current-buffer "*hord-list*"
+          (setq hord-list-filter result)
+          (hord--list-update)))
+    (setq hord-list-filter-active nil)))
 
 (defun hord-list-set-filter ()
   "Set the hord list filter without live preview."
