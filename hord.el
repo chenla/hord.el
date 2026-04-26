@@ -142,6 +142,7 @@
 (defvar hord--titles nil "Hash table: UUID → title.")
 (defvar hord--types nil "Hash table: UUID → type.")
 (defvar hord--quads nil "Hash table: UUID → list of quads.")
+(defvar hord--authors nil "Hash table: UUID → author string.")
 (defvar hord--incoming nil "Hash table: UUID → list of (predicate . source-uuid).")
 (defvar hord--loaded-root nil "Root that was last loaded.")
 
@@ -164,6 +165,7 @@
           hord--index-reverse (make-hash-table :test 'equal)
           hord--titles (make-hash-table :test 'equal)
           hord--types (make-hash-table :test 'equal)
+          hord--authors (make-hash-table :test 'equal)
           hord--quads (make-hash-table :test 'equal)
           hord--incoming (make-hash-table :test 'equal))
     ;; Load index
@@ -212,7 +214,8 @@
                ((string= p "v:title")
                 ;; Collapse multiline whitespace from bib imports
                 (puthash s (replace-regexp-in-string "[\n\t ]+" " " o) hord--titles))
-               ((string= p "v:type") (puthash s o hord--types)))
+               ((string= p "v:type") (puthash s o hord--types))
+               ((string= p "v:author") (puthash s o hord--authors)))
               ;; Build incoming links index (skip PT, title, type)
               (when (and (not (string= p "v:pt"))
                          (not (string= p "v:title"))
@@ -277,6 +280,10 @@
     (with-temp-buffer
       (insert-file-contents filepath)
       (let (result)
+        ;; #+TITLE from header
+        (goto-char (point-min))
+        (when (re-search-forward "^#\\+TITLE:\\s-+\\(.+\\)" nil t)
+          (push (cons "TITLE" (string-trim (match-string 1))) result))
         ;; Main PROPERTIES drawer
         (goto-char (point-min))
         (when (re-search-forward ":PROPERTIES:" nil t)
@@ -360,7 +367,12 @@
     (insert (make-string 56 ?─) "\n")
 
     ;; Metadata
+    (let ((full-title (cdr (assoc "TITLE" meta))))
+      (when full-title
+        (hord--insert-meta "Title" full-title)))
     (hord--insert-meta "Type" (hord--type-label (hord-entity-type entity)))
+    (let ((author (gethash uuid hord--authors)))
+      (when author (hord--insert-meta "Author" author)))
     (let ((created (cdr (assoc "CREATED" meta))))
       (when created (hord--insert-meta "Created" created)))
     (let ((source (cdr (assoc "SOURCE" meta))))
@@ -492,8 +504,9 @@
   "Current filter string for the hord list view.
 Filter syntax (space-separated tokens):
   @type    — show only this type (e.g. @con, @per, @cap)
-  text     — match title (case-insensitive)
+  #author  — match author (e.g. #alexander, #braudel)
   +dir     — match directory (e.g. +capture, +content)
+  text     — match title (case-insensitive)
 Multiple tokens are ANDed together.")
 
 (defvar hord-list-filter-active nil
@@ -537,27 +550,32 @@ Examples:
 
 (defun hord--parse-filter (filter-str)
   "Parse FILTER-STR into a plist of filter components.
-Returns (:types (list) :dirs (list) :terms (list))."
-  (let (types dirs terms)
+Returns (:types (list) :dirs (list) :authors (list) :terms (list))."
+  (let (types dirs authors terms)
     (dolist (token (split-string (string-trim filter-str)))
       (cond
        ((string-prefix-p "@" token)
         (push (substring token 1) types))
+       ((string-prefix-p "#" token)
+        (push (downcase (substring token 1)) authors))
        ((string-prefix-p "+" token)
         (push (substring token 1) dirs))
        ((not (string-empty-p token))
         (push (downcase token) terms))))
     (list :types (nreverse types)
           :dirs (nreverse dirs)
+          :authors (nreverse authors)
           :terms (nreverse terms))))
 
 (defun hord--entity-matches-filter (entity filter)
   "Test if ENTITY (uuid title type path) matches parsed FILTER."
-  (let ((title (downcase (nth 1 entity)))
+  (let ((uuid (nth 0 entity))
+        (title (downcase (nth 1 entity)))
         (type (nth 2 entity))
         (path (nth 3 entity))
         (types (plist-get filter :types))
         (dirs (plist-get filter :dirs))
+        (authors (plist-get filter :authors))
         (terms (plist-get filter :terms)))
     (and
      ;; Type filter: match short name or full vocab id
@@ -571,6 +589,12 @@ Returns (:types (list) :dirs (list) :terms (list))."
          (seq-some (lambda (d)
                      (string-match-p (regexp-quote d) path))
                    dirs))
+     ;; Author filter
+     (or (null authors)
+         (let ((author (downcase (or (gethash uuid hord--authors) ""))))
+           (seq-every-p (lambda (a)
+                          (string-match-p (regexp-quote a) author))
+                        authors)))
      ;; Term filter: all terms must match title
      (or (null terms)
          (seq-every-p (lambda (term)
@@ -612,7 +636,7 @@ Updates the list in real-time as you type."
   (setq hord-list-filter-active :live)
   (unwind-protect
       (let ((result (read-from-minibuffer
-                     "Filter (@type +dir text): "
+                     "Filter (@type #author +dir text): "
                      hord-list-filter)))
         (with-current-buffer "*hord-list*"
           (setq hord-list-filter result)
@@ -624,7 +648,7 @@ Updates the list in real-time as you type."
   (interactive)
   (setq hord-list-filter
         (read-from-minibuffer
-         "Filter (@type +dir text): "
+         "Filter (@type #author +dir text): "
          hord-list-filter))
   (hord--list-update))
 
