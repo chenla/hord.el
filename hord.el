@@ -209,7 +209,9 @@
               (push (make-hord-quad :subject s :predicate p :object o :context c) quads)
               ;; Index title and type
               (cond
-               ((string= p "v:title") (puthash s o hord--titles))
+               ((string= p "v:title")
+                ;; Collapse multiline whitespace from bib imports
+                (puthash s (replace-regexp-in-string "[\n\t ]+" " " o) hord--titles))
                ((string= p "v:type") (puthash s o hord--types)))
               ;; Build incoming links index (skip PT, title, type)
               (when (and (not (string= p "v:pt"))
@@ -252,6 +254,12 @@
 (defun hord--title-for-uuid (uuid)
   "Return the title for UUID, or UUID itself if unknown."
   (or (gethash uuid hord--titles) uuid))
+
+(defun hord--truncate (str max)
+  "Truncate STR to MAX chars, adding \u2026 if truncated."
+  (if (> (length str) max)
+      (concat (substring str 0 (1- max)) "\u2026")
+    str))
 
 (defun hord--type-label (type-id)
   "Return human label for TYPE-ID."
@@ -496,8 +504,9 @@
 \\{hord-list-mode-map}"
   (setq tabulated-list-format
         [("Type" 12 t)
-         ("Title" 45 t)
+         ("Title" 55 t)
          ("Created" 20 t)])
+  (setq truncate-lines t)
   (setq tabulated-list-sort-key '("Title" . nil))
   (setq tabulated-list-padding 1)
   (tabulated-list-init-header))
@@ -520,7 +529,7 @@
               (created (or (cdr (assoc "CREATED" meta)) "")))
          (list uuid
                (vector (hord--type-label type)
-                       title
+                       (hord--truncate title 55)
                        (if (> (length created) 16)
                            (substring created 0 16)
                          created)))))
