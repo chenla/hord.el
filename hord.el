@@ -481,7 +481,7 @@
     (define-key map (kbd "b")   #'hord-back)
     (define-key map (kbd "e")   #'hord-edit)
     (define-key map (kbd "l")   #'hord-list)
-    (define-key map (kbd "s")   #'hord-find)
+    (define-key map (kbd "s")   #'hord-list-and-filter)
     (define-key map (kbd "t")   #'hord-list-type)
     (define-key map (kbd "g")   #'hord-refresh)
     (define-key map (kbd "q")   #'quit-window)
@@ -580,9 +580,9 @@ Returns (:types (list) :dirs (list) :authors (list) :terms (list))."
     (and
      ;; Type filter: match short name or full vocab id
      (or (null types)
-         (seq-some (lambda (t)
-                     (or (string= type (concat "wh:" t))
-                         (string= type t)))
+         (seq-some (lambda (ty)
+                     (or (string= type (concat "wh:" ty))
+                         (string= type ty)))
                    types))
      ;; Directory filter
      (or (null dirs)
@@ -703,7 +703,7 @@ Updates the list in real-time as you type."
   (interactive)
   (if (derived-mode-p 'hord-list-mode)
       (message "RET open  s live-filter  S set-filter  c clear  t type  g refresh  q quit")
-    (message "RET follow  TAB/S-TAB links  b back  e edit  g refresh  s search  t type  l list  q quit")))
+    (message "RET follow  TAB/S-TAB links  b back  e edit  g refresh  s filter  t type  l list  q quit")))
 
 ;; ── Interactive commands ──────────────────────────────────
 
@@ -753,6 +753,13 @@ Optional INITIAL-FILTER sets the starting filter string."
       (setq hord-list-filter (or initial-filter ""))
       (hord--list-update))
     (pop-to-buffer-same-window buf)))
+
+(defun hord-list-and-filter ()
+  "Switch to the hord list and immediately start live filtering.
+Useful from card view to search/filter without going back first."
+  (interactive)
+  (hord-list)
+  (hord-list-live-filter))
 
 (defun hord-list-type ()
   "Set filter to a specific type via completing-read."
