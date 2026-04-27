@@ -49,6 +49,18 @@
   :type 'directory
   :group 'hord)
 
+(defcustom hord-external-viewers
+  '(("pdf"  . "okular")
+    ("epub" . "xdg-open")
+    ("djvu" . "djview")
+    ("mobi" . "xdg-open"))
+  "Alist mapping file extensions to external viewer commands.
+Each entry is (EXTENSION . COMMAND).  The file path is passed as
+the first argument to COMMAND.  Extensions not listed here are
+opened in Emacs (e.g. md, org, txt)."
+  :type '(alist :key-type string :value-type string)
+  :group 'hord)
+
 (defcustom hord-type-labels
   '(("wh:con" . "Concept")
     ("wh:pat" . "Pattern")
@@ -125,6 +137,16 @@
   "Face for incoming link source indicator."
   :group 'hord)
 
+(defface hord-cite-link
+  '((t :inherit font-lock-constant-face :underline t))
+  "Face for cite:key references that resolve to a card or blob."
+  :group 'hord)
+
+(defface hord-cite-link-unresolved
+  '((t :inherit font-lock-comment-face))
+  "Face for cite:key references with no matching card or blob."
+  :group 'hord)
+
 ;; ── Data structures ───────────────────────────────────────
 
 (cl-defstruct hord-quad
@@ -144,6 +166,8 @@
 (defvar hord--quads nil "Hash table: UUID → list of quads.")
 (defvar hord--authors nil "Hash table: UUID → author string.")
 (defvar hord--incoming nil "Hash table: UUID → list of (predicate . source-uuid).")
+(defvar hord--citekeys nil "Hash table: citekey → UUID.")
+(defvar hord--citekeys-reverse nil "Hash table: UUID → citekey.")
 (defvar hord--loaded-root nil "Root that was last loaded.")
 
 (defun hord--ensure-loaded ()
@@ -183,8 +207,12 @@
         (forward-line 1)))
     ;; Load all quad files
     (hord--load-quads quads-dir)
+    ;; Build citekey index
+    (hord--build-citekey-index root)
     (setq hord--loaded-root root)
-    (message "Loaded hord: %d entities" (hash-table-count hord--index))))
+    (message "Loaded hord: %d entities, %d citekeys"
+             (hash-table-count hord--index)
+             (hash-table-count hord--citekeys))))
 
 (defun hord--load-quads (quads-dir)
   "Load all quad files from QUADS-DIR."
@@ -228,6 +256,22 @@
         (forward-line 1))
       (when uuid
         (puthash uuid (nreverse quads) hord--quads)))))
+
+(defun hord--build-citekey-index (root)
+  "Build citekey → UUID index by scanning org files for :CITEKEY: properties."
+  (setq hord--citekeys (make-hash-table :test 'equal))
+  (setq hord--citekeys-reverse (make-hash-table :test 'equal))
+  (let* ((default-directory root)
+         (output (shell-command-to-string
+                  "grep -r --include='*.org' ':CITEKEY:' content/ capture/ 2>/dev/null")))
+    (dolist (line (split-string output "\n" t))
+      (when (string-match "^\\(.+\\.org\\):\\s-*:CITEKEY:\\s-+\\(.+\\)" line)
+        (let* ((filepath (match-string 1 line))
+               (citekey (string-trim (match-string 2 line)))
+               (uuid (gethash filepath hord--index-reverse)))
+          (when uuid
+            (puthash citekey uuid hord--citekeys)
+            (puthash uuid citekey hord--citekeys-reverse)))))))
 
 (defun hord--entity (uuid)
   "Build a `hord-entity' for UUID."
@@ -309,35 +353,57 @@
                                 (string-trim (match-string 2)))
                           bib-fields))
                   (push (cons "BIB-DATA" (nreverse bib-fields)) result))))))
-        ;; Notes section body
+        ;; Notes section body — try explicit ** Notes first,
+        ;; then fall back to body text between :END: and first ** heading
         (goto-char (point-min))
-        (when (re-search-forward "^\\*\\* Notes" nil t)
-          (forward-line 1)
-          (let ((body-start (point))
-                (body-end (or (save-excursion
-                                (re-search-forward "^\\*+ " nil t)
-                                (line-beginning-position))
-                              (point-max))))
-            (let ((body (string-trim
-                         (buffer-substring-no-properties
-                          body-start body-end))))
-              (unless (string-empty-p body)
-                (push (cons "BODY" body) result)))))
+        (let ((notes-found (re-search-forward "^\\*\\* Notes" nil t)))
+          (if notes-found
+              (progn
+                (forward-line 1)
+                (let ((body-start (point))
+                      (body-end (or (save-excursion
+                                      (when (re-search-forward "^\\*+ " nil t)
+                                        (line-beginning-position)))
+                                    (point-max))))
+                  (let ((body (string-trim
+                               (buffer-substring-no-properties
+                                body-start body-end))))
+                    (unless (string-empty-p body)
+                      (push (cons "BODY" body) result)))))
+            ;; Fallback: grab text between first :END: and first ** heading,
+            ;; skipping relation lines (- XX ::) and org directives (#+)
+            (goto-char (point-min))
+            (when (re-search-forward "^\\s-*:END:" nil t)
+              (forward-line 1)
+              (let ((body-start (point))
+                    (body-end (or (save-excursion
+                                    (when (re-search-forward "^\\*\\* " nil t)
+                                      (line-beginning-position)))
+                                  (point-max))))
+                (let ((raw (buffer-substring-no-properties body-start body-end)))
+                  ;; Strip relation lines and org directives
+                  (setq raw (replace-regexp-in-string
+                             "^\\s-*- [A-Z]+ ::.*\n?" "" raw))
+                  (setq raw (replace-regexp-in-string
+                             "^#\\+.*\n?" "" raw))
+                  (setq raw (string-trim raw))
+                  (unless (string-empty-p raw)
+                    (push (cons "BODY" raw) result)))))))
         ;; References section (** or * level)
         (goto-char (point-min))
         (when (re-search-forward "^\\*+ References" nil t)
           (forward-line 1)
           (let ((ref-start (point))
                 (ref-end (or (save-excursion
-                               (re-search-forward "^\\*\\* " nil t)
-                               (line-beginning-position))
+                               (when (re-search-forward "^\\*\\* " nil t)
+                                 (line-beginning-position)))
                              (point-max))))
             (let ((refs (string-trim
                          (buffer-substring-no-properties
                           ref-start ref-end))))
               ;; Strip bibliography: lines
               (setq refs (replace-regexp-in-string
-                          "^\\s*bibliography:.*\n?" "" refs))
+                          "^[ \t]*bibliography:.*\n?" "" refs))
               (setq refs (string-trim refs))
               (unless (string-empty-p refs)
                 (push (cons "REFS" refs) result)))))
@@ -347,6 +413,134 @@
 
 (defvar-local hord--history nil "Navigation history for this buffer.")
 (defvar-local hord--current-uuid nil "UUID of the currently displayed card.")
+
+;; ── Citation lookup ──────────────────────────────────────
+
+(defun hord--open-file (filepath)
+  "Open FILEPATH using the appropriate viewer.
+Files with extensions in `hord-external-viewers' are opened
+externally; everything else opens in Emacs."
+  (let* ((ext (downcase (or (file-name-extension filepath) "")))
+         (viewer (cdr (assoc ext hord-external-viewers))))
+    (if viewer
+        (progn
+          (start-process "hord-viewer" nil viewer filepath)
+          (message "Opened %s with %s" (file-name-nondirectory filepath) viewer))
+      (find-file-other-window filepath))))
+
+(defun hord--blob-files-for-key (citekey)
+  "Return list of files in lib/blob/ matching CITEKEY.
+Matches both colon and space as the author:year separator,
+since blob filenames use both conventions."
+  (let ((blob-dir (expand-file-name "lib/blob/" hord-root)))
+    (when (file-directory-p blob-dir)
+      ;; Build pattern: replace colons with [: ] to match either separator
+      (let ((pattern (concat "^"
+                             (replace-regexp-in-string
+                              ":" "[: ]"
+                              (regexp-quote citekey))
+                             "\\.")))
+        (directory-files blob-dir t pattern)))))
+
+(defun hord--bib-links-for-uuid (uuid)
+  "Return an alist of link fields from the Bibliographic Data of UUID.
+Possible keys: \"URL\", \"DOI\".  Values are strings."
+  (let* ((entity (hord--entity uuid))
+         (filepath (hord-entity-filepath entity))
+         result)
+    (when (and filepath (file-exists-p filepath))
+      (with-temp-buffer
+        (insert-file-contents filepath)
+        (goto-char (point-min))
+        (when (re-search-forward "^\\*\\* Bibliographic Data" nil t)
+          (let ((end (or (save-excursion
+                           (when (re-search-forward "^\\*\\* " nil t)
+                             (line-beginning-position)))
+                         (point-max))))
+            (when (re-search-forward ":URL:\\s-+\\(.+\\)" end t)
+              (push (cons "URL" (string-trim (match-string 1))) result))
+            (goto-char (point-min))
+            (re-search-forward "^\\*\\* Bibliographic Data" nil t)
+            (when (re-search-forward ":DOI:\\s-+\\(.+\\)" end t)
+              (push (cons "DOI" (string-trim (match-string 1))) result))))))
+    result))
+
+(defun hord--cite-dispatch (key)
+  "Look up cite KEY and act: open card, DOI, URL, or blob file.
+Gathers all available targets and presents a menu if more than one."
+  (let* ((uuid (gethash key hord--citekeys))
+         (blobs (hord--blob-files-for-key key))
+         (links (when uuid (hord--bib-links-for-uuid uuid)))
+         (url (cdr (assoc "URL" links)))
+         (doi (cdr (assoc "DOI" links)))
+         (choices nil))
+    ;; Build choice list (pushed in reverse display order)
+    (dolist (f blobs)
+      (push (cons (format "File: %s" (file-name-nondirectory f))
+                  (cons 'file f))
+            choices))
+    (when url
+      (push (cons (format "URL:  %s" (hord--truncate url 50))
+                  (cons 'url url))
+            choices))
+    (when doi
+      (push (cons (format "DOI:  %s" doi)
+                  (cons 'url (concat "https://doi.org/" doi)))
+            choices))
+    (when uuid
+      (push (cons (format "Card: %s" (hord--title-for-uuid uuid))
+                  (cons 'card uuid))
+            choices))
+    (cond
+     ;; Nothing found
+     ((null choices)
+      (message "No card, URL, or files found for cite:%s" key))
+     ;; Single option — act directly
+     ((= (length choices) 1)
+      (hord--cite-act (cdar choices)))
+     ;; Multiple options — completing-read
+     (t
+      (let* ((choice (completing-read (format "cite:%s → " key)
+                                      (mapcar #'car choices) nil t))
+             (action (cdr (assoc choice choices))))
+        (hord--cite-act action))))))
+
+(defun hord--cite-act (action)
+  "Execute a cite ACTION cons cell (type . value)."
+  (pcase (car action)
+    ('card (hord-open (cdr action)))
+    ('url  (browse-url (cdr action)))
+    ('file (hord--open-file (cdr action)))))
+
+(defun hord--cite-button-action (btn)
+  "Action for a cite:key button."
+  (hord--cite-dispatch (button-get btn 'hord-citekey)))
+
+(defun hord--insert-with-cite-links (text)
+  "Insert TEXT, turning cite:key references into clickable buttons."
+  (let ((start 0))
+    (while (string-match "cite:\\([a-zA-Z0-9:_-]+\\)" text start)
+      ;; Insert text before the match
+      (insert (substring text start (match-beginning 0)))
+      (let* ((key (match-string 1 text))
+             (uuid (gethash key hord--citekeys))
+             (blobs (hord--blob-files-for-key key))
+             (resolved (or uuid blobs)))
+        (insert-text-button
+         (concat "cite:" key)
+         'face (if resolved 'hord-cite-link 'hord-cite-link-unresolved)
+         'hord-citekey key
+         'action #'hord--cite-button-action
+         'follow-link t
+         'help-echo (cond
+                     ((and uuid blobs)
+                      (format "%s + %d file(s)" (hord--title-for-uuid uuid) (length blobs)))
+                     (uuid (hord--title-for-uuid uuid))
+                     (blobs (format "%d file(s) in blob/" (length blobs)))
+                     (t (format "cite:%s (unresolved)" key)))))
+      (setq start (match-end 0)))
+    ;; Insert remaining text
+    (insert (substring text start))))
 
 ;; ── Card view rendering ──────────────────────────────────
 
@@ -433,7 +627,31 @@
             (insert "  "
                     (propertize (format "%-12s" (concat key ":"))
                                 'face 'hord-metadata-key)
-                    " " val "\n")))
+                    " ")
+            (cond
+             ;; DOI — clickable link to doi.org
+             ((string= key "DOI")
+              (insert-text-button
+               val
+               'face 'hord-link
+               'action (lambda (btn)
+                         (browse-url (concat "https://doi.org/"
+                                             (button-get btn 'hord-doi))))
+               'hord-doi val
+               'follow-link t
+               'help-echo (format "https://doi.org/%s" val)))
+             ;; URL — clickable link
+             ((string= key "URL")
+              (insert-text-button
+               (hord--truncate val 55)
+               'face 'hord-link
+               'action (lambda (btn)
+                         (browse-url (button-get btn 'hord-url)))
+               'hord-url val
+               'follow-link t
+               'help-echo val))
+             (t (insert val)))
+            (insert "\n")))
         (insert "\n")))
 
     ;; Notes body
@@ -442,7 +660,8 @@
         (insert (propertize "── Notes " 'face 'hord-section-header)
                 (propertize (make-string 47 ?─) 'face 'hord-section-header)
                 "\n")
-        (insert body "\n\n")))
+        (hord--insert-with-cite-links body)
+        (insert "\n\n")))
 
     ;; References
     (let ((refs (cdr (assoc "REFS" meta))))
@@ -450,7 +669,8 @@
         (insert (propertize "── References " 'face 'hord-section-header)
                 (propertize (make-string 42 ?─) 'face 'hord-section-header)
                 "\n")
-        (insert refs "\n")))
+        (hord--insert-with-cite-links refs)
+        (insert "\n")))
 
     (goto-char (point-min))))
 
@@ -504,9 +724,10 @@
   "Current filter string for the hord list view.
 Filter syntax (space-separated tokens):
   @type    — show only this type (e.g. @con, @per, @cap)
+  @cite    — match terms against citekeys instead of titles
   #author  — match author (e.g. #alexander, #braudel)
   +dir     — match directory (e.g. +capture, +content)
-  text     — match title (case-insensitive)
+  text     — match title or citekey (case-insensitive)
 Multiple tokens are ANDed together.")
 
 (defvar hord-list-filter-active nil
@@ -530,13 +751,14 @@ Multiple tokens are ANDed together.")
   "Major mode for browsing Hoard entities.
 
 Filter with `s' (live) or `S' (set). Clear with `c'.
-Filter syntax: @type +dir text (space-separated, ANDed).
+Filter syntax: @type @cite #author +dir text (space-separated, ANDed).
 
 Examples:
   @con              — show concepts only
   @per alexander    — persons matching 'alexander'
   +capture          — capture cards only
   braudel           — anything with 'braudel' in title
+  @cite mann        — cards with citekey matching 'mann'
 
 \\{hord-list-mode-map}"
   (setq tabulated-list-format
@@ -550,10 +772,13 @@ Examples:
 
 (defun hord--parse-filter (filter-str)
   "Parse FILTER-STR into a plist of filter components.
-Returns (:types (list) :dirs (list) :authors (list) :terms (list))."
-  (let (types dirs authors terms)
+Returns (:types (list) :dirs (list) :authors (list) :terms (list) :cite t/nil).
+The special token @cite switches term matching to citekey mode."
+  (let (types dirs authors terms cite)
     (dolist (token (split-string (string-trim filter-str)))
       (cond
+       ((string= token "@cite")
+        (setq cite t))
        ((string-prefix-p "@" token)
         (push (substring token 1) types))
        ((string-prefix-p "#" token)
@@ -565,10 +790,12 @@ Returns (:types (list) :dirs (list) :authors (list) :terms (list))."
     (list :types (nreverse types)
           :dirs (nreverse dirs)
           :authors (nreverse authors)
-          :terms (nreverse terms))))
+          :terms (nreverse terms)
+          :cite cite)))
 
 (defun hord--entity-matches-filter (entity filter)
-  "Test if ENTITY (uuid title type path) matches parsed FILTER."
+  "Test if ENTITY (uuid title type path) matches parsed FILTER.
+When :cite is set in FILTER, terms match against citekeys instead of titles."
   (let ((uuid (nth 0 entity))
         (title (downcase (nth 1 entity)))
         (type (nth 2 entity))
@@ -576,7 +803,8 @@ Returns (:types (list) :dirs (list) :authors (list) :terms (list))."
         (types (plist-get filter :types))
         (dirs (plist-get filter :dirs))
         (authors (plist-get filter :authors))
-        (terms (plist-get filter :terms)))
+        (terms (plist-get filter :terms))
+        (cite (plist-get filter :cite)))
     (and
      ;; Type filter: match short name or full vocab id
      (or (null types)
@@ -595,11 +823,19 @@ Returns (:types (list) :dirs (list) :authors (list) :terms (list))."
            (seq-every-p (lambda (a)
                           (string-match-p (regexp-quote a) author))
                         authors)))
-     ;; Term filter: all terms must match title
+     ;; Term filter: match title or citekey depending on mode
      (or (null terms)
-         (seq-every-p (lambda (term)
-                        (string-match-p (regexp-quote term) title))
-                      terms)))))
+         (if cite
+             ;; @cite mode: match terms against this entity's citekey
+             (let ((citekey (downcase (or (gethash uuid hord--citekeys-reverse) ""))))
+               (and (not (string-empty-p citekey))
+                    (seq-every-p (lambda (term)
+                                   (string-match-p (regexp-quote term) citekey))
+                                 terms)))
+           ;; Normal mode: match title
+           (seq-every-p (lambda (term)
+                          (string-match-p (regexp-quote term) title))
+                        terms))))))
 
 (defun hord--list-entries-filtered (filter-str)
   "Build tabulated-list entries matching FILTER-STR.
@@ -703,7 +939,7 @@ Updates the list in real-time as you type."
   (interactive)
   (if (derived-mode-p 'hord-list-mode)
       (message "RET open  s live-filter  S set-filter  c clear  t type  g refresh  q quit")
-    (message "RET follow  TAB/S-TAB links  b back  e edit  g refresh  s filter  t type  l list  q quit")))
+    (message "RET follow  TAB/S-TAB links  b back  e edit  g refresh  s filter  t type  l list  C-c W c cite  q quit")))
 
 ;; ── Interactive commands ──────────────────────────────────
 
@@ -983,6 +1219,34 @@ Run this while editing a card in org-mode."
             (save-buffer)
             (message "Added %d RT links" (length chosen))))))))
 
+;; ── Citation lookup from org-mode ─────────────────────────
+
+(defun hord--cite-at-point ()
+  "Extract a cite:key reference at or near point.
+Returns the citekey string (without the cite: prefix), or nil."
+  (save-excursion
+    (let ((case-fold-search nil))
+      ;; If point is on or right after "cite:", back up into it
+      (when (looking-back "cite:" (- (point) 5))
+        (goto-char (match-beginning 0)))
+      ;; If inside a cite:key, move to start
+      (skip-chars-backward "a-zA-Z0-9:_-")
+      (when (looking-back "cite:" (- (point) 5))
+        (goto-char (match-beginning 0)))
+      (when (looking-at "cite:\\([a-zA-Z0-9:_-]+\\)")
+        (match-string-no-properties 1)))))
+
+(defun hord-lookup-cite-at-point ()
+  "Look up the cite:key at point.
+Opens card, URL, or blob files — with a menu when multiple exist.
+Works from any buffer (org-mode, hord reader, etc.)."
+  (interactive)
+  (hord--ensure-loaded)
+  (let ((key (hord--cite-at-point)))
+    (if key
+        (hord--cite-dispatch key)
+      (message "No cite:key at point"))))
+
 ;; ── Keybinding ────────────────────────────────────────────
 
 ;;;###autoload
@@ -993,6 +1257,9 @@ Run this while editing a card in org-mode."
 
 ;;;###autoload
 (global-set-key (kbd "C-c W r") #'hord-suggest-rt)
+
+;;;###autoload
+(global-set-key (kbd "C-c W c") #'hord-lookup-cite-at-point)
 
 (provide 'hord)
 ;;; hord.el ends here
