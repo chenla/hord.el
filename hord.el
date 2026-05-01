@@ -1521,6 +1521,113 @@ any pending items from the Orgzly inbox."
                   (completing-read "Scratch file: " files nil t)
                   dir)))))
 
+;; ── Add blob ─────────────────────────────────────────────
+
+(defun hord-add-blob (filepath citekey)
+  "Add a file to the hord blob store via `hord add'.
+FILEPATH is the file to add.  CITEKEY is author:yearslug.
+Creates a wh:wrk card and copies the file to lib/blob/."
+  (interactive
+   (list (read-file-name "File to add: " nil nil t)
+         (read-string "Citekey (author:yearslug): ")))
+  (let* ((title (read-string "Title (empty = derive from key): "))
+         (author (read-string "Author (empty = derive from key): "))
+         (context-p (y-or-n-p "Generate LOD context file? "))
+         (default-directory (expand-file-name hord-root))
+         (cmd (list "hord" "add" (expand-file-name filepath)
+                    "-k" citekey)))
+    (when (not (string-empty-p title))
+      (setq cmd (append cmd (list "-t" title))))
+    (when (not (string-empty-p author))
+      (setq cmd (append cmd (list "-a" author))))
+    (when context-p
+      (setq cmd (append cmd (list "--context"))))
+    (let ((output (with-output-to-string
+                    (with-current-buffer standard-output
+                      (apply #'call-process (car cmd) nil t nil (cdr cmd))))))
+      (message "%s" (string-trim output))
+      ;; Reload to pick up new citekey
+      (hord-reload))))
+
+;; ── Link add (all relation types) ───────────────────────
+
+(defvar hord-link-relation-types
+  '("RT" "BT" "NT" "TT" "BTG" "BTI" "BTP" "NTG" "NTI" "NTP" "UF" "PT" "USE")
+  "Valid thesaurus relation types for `hord-link-add'.")
+
+(defun hord-link-add (rel-type)
+  "Add a thesaurus relation from the current card.
+REL-TYPE is one of BT, NT, RT, TT, UF, PT, etc.
+For UUID relations (BT/NT/RT/TT etc.), prompts to select
+a target card.  For text relations (UF/PT), prompts for text.
+Writes directly to the current org buffer and saves."
+  (interactive
+   (list (completing-read "Relation type: "
+                          hord-link-relation-types nil t)))
+  (hord--ensure-loaded)
+  (let ((uuid (hord--current-card-uuid)))
+    (unless uuid
+      (error "No :ID: found in this buffer — not a hord card?"))
+    (let* ((text-rels '("UF" "PT"))
+           (is-text (member rel-type text-rels))
+           target-uuid target-label rel-line)
+      (if is-text
+          ;; Text relation — just a label
+          (progn
+            (setq target-label (read-string (format "%s label: " rel-type)))
+            (setq rel-line (format "   - %s :: %s" rel-type target-label)))
+        ;; UUID relation — pick a card
+        (let* ((entities (hord--all-entities))
+               (choices (mapcar
+                         (lambda (e)
+                           (cons (format "%-12s %s"
+                                         (hord--type-label (nth 2 e))
+                                         (nth 1 e))
+                                 (nth 0 e)))
+                         entities))
+               (choice (completing-read
+                        (format "%s → " rel-type) choices nil t))
+               (pair (assoc choice choices)))
+          (unless pair
+            (error "No card selected"))
+          (setq target-uuid (cdr pair))
+          (setq target-label (replace-regexp-in-string
+                              "^[^ ]+ +" "" (car pair)))
+          (setq rel-line (format "   - %s :: [[id:%s][%s]]"
+                                 rel-type target-uuid target-label))))
+      ;; Insert into Relations section
+      (save-excursion
+        (goto-char (point-min))
+        (if (re-search-forward "^\\*\\* Relations" nil t)
+            (progn
+              (end-of-line)
+              ;; Move past existing relations
+              (while (and (not (eobp))
+                          (progn (forward-line 1)
+                                 (looking-at "\\s-+- ")))
+                (end-of-line))
+              ;; Now insert after last relation line
+              (end-of-line 0)
+              (insert "\n" rel-line))
+          ;; No Relations section — create before ** Notes
+          (goto-char (point-min))
+          (if (re-search-forward "^\\*\\* Notes" nil t)
+              (progn
+                (beginning-of-line)
+                (insert "** Relations\n" rel-line "\n\n"))
+            ;; No Notes either — append
+            (goto-char (point-max))
+            (insert "\n** Relations\n" rel-line "\n"))))
+      (save-buffer)
+      ;; Add reciprocal via CLI (handles the other file)
+      (when (and target-uuid
+                 (not is-text))
+        (let ((default-directory (expand-file-name hord-root)))
+          (call-process "hord" nil nil nil
+                        "link" "add" uuid rel-type target-uuid
+                        "--no-reciprocal")))
+      (message "Added %s → %s" rel-type target-label))))
+
 ;; ── Keybinding ────────────────────────────────────────────
 
 ;;;###autoload
@@ -1534,6 +1641,12 @@ any pending items from the Orgzly inbox."
 
 ;;;###autoload
 (global-set-key (kbd "C-c W c") #'hord-lookup-cite-at-point)
+
+;;;###autoload
+(global-set-key (kbd "C-c W a") #'hord-add-blob)
+
+;;;###autoload
+(global-set-key (kbd "C-c W L") #'hord-link-add)
 
 ;;;###autoload
 (global-set-key (kbd "C-c W s") #'hord-scratch)
