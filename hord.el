@@ -1247,6 +1247,128 @@ Works from any buffer (org-mode, hord reader, etc.)."
         (hord--cite-dispatch key)
       (message "No cite:key at point"))))
 
+;; ── Scratch pad ──────────────────────────────────────────
+
+(defcustom hord-scratch-directory "~/proj/ybr/bench/scratch/"
+  "Directory where daily scratch files are kept."
+  :type 'directory
+  :group 'hord)
+
+(defcustom hord-scratch-inbox-file "~/proj/org/gtd/inbox.org"
+  "Orgzly inbox file synced via Syncthing."
+  :type 'file
+  :group 'hord)
+
+(defun hord-scratch--file-for-date (date)
+  "Return the scratch file path for DATE (a time value)."
+  (expand-file-name (format-time-string "%Y-%m-%d.org" date)
+                    hord-scratch-directory))
+
+(defun hord-scratch--ensure-dir ()
+  "Create the scratch directory if it doesn't exist."
+  (let ((dir (expand-file-name hord-scratch-directory)))
+    (unless (file-directory-p dir)
+      (make-directory dir t))))
+
+(defun hord-scratch--init-buffer (file date)
+  "Insert the header template into FILE for DATE."
+  (insert (format-time-string
+           "#+TITLE: Scratch — %A %e %B %Y\n\n** " date))
+  (save-buffer))
+
+(defun hord-scratch--import-inbox ()
+  "Import pending items from Orgzly inbox into current scratch buffer.
+Moves non-DONE top-level headings from `hord-scratch-inbox-file'
+into the scratch buffer under a Mobile Inbox heading, then removes
+them from the inbox file.  DONE items are left in place."
+  (let* ((inbox (expand-file-name hord-scratch-inbox-file))
+         items)
+    (when (and (file-exists-p inbox)
+               (> (file-attribute-size (file-attributes inbox)) 0))
+      ;; Collect non-DONE headings from inbox
+      (with-current-buffer (find-file-noselect inbox)
+        (org-with-wide-buffer
+         (goto-char (point-min))
+         (while (re-search-forward "^\\* " nil t)
+           (let ((element (org-element-at-point)))
+             (when (not (org-element-property :todo-keyword element))
+               (let ((beg (org-element-property :begin element))
+                     (end (org-element-property :end element)))
+                 (push (buffer-substring-no-properties beg end) items)))))
+         ;; Remove collected items (reverse so positions stay valid)
+         (dolist (item (reverse items))
+           (goto-char (point-min))
+           (when (search-forward item nil t)
+             (delete-region (match-beginning 0) (match-end 0))))
+         (when items (save-buffer))))
+      ;; Append to scratch
+      (when items
+        (goto-char (point-max))
+        (unless (bolp) (insert "\n"))
+        (insert "\n** Mobile inbox [" (format-time-string "%Y-%m-%d %a %H:%M") "]\n\n")
+        (dolist (item (nreverse items))
+          ;; Demote: top-level * becomes ** so they nest under Mobile inbox
+          (insert (replace-regexp-in-string "^\\* " "*** " item)))
+        (save-buffer)
+        (message "Imported %d item(s) from inbox" (length items))))))
+
+;;;###autoload
+(defun hord-scratch ()
+  "Open today's scratch pad.
+Creates the file and directory if needed.  Automatically imports
+any pending items from the Orgzly inbox."
+  (interactive)
+  (hord-scratch--ensure-dir)
+  (let* ((today (current-time))
+         (file  (hord-scratch--file-for-date today)))
+    (find-file file)
+    (when (= (buffer-size) 0)
+      (hord-scratch--init-buffer file today))
+    (hord-scratch--import-inbox)))
+
+;;;###autoload
+(defun hord-scratch-tomorrow ()
+  "Move region (or current subtree) to tomorrow's scratch file."
+  (interactive)
+  (hord-scratch--ensure-dir)
+  (let* ((tomorrow (time-add (current-time) (* 24 60 60)))
+         (file     (hord-scratch--file-for-date tomorrow))
+         (text     (if (use-region-p)
+                       (prog1 (buffer-substring (region-beginning) (region-end))
+                         (delete-region (region-beginning) (region-end)))
+                     (org-back-to-heading t)
+                     (let ((beg (point))
+                           (end (org-end-of-subtree t t)))
+                       (prog1 (buffer-substring beg end)
+                         (delete-region beg end))))))
+    ;; Ensure target file exists with header
+    (unless (file-exists-p file)
+      (with-temp-file file
+        (insert (format-time-string
+                 "#+TITLE: Scratch — %A %e %B %Y\n\n" tomorrow))))
+    ;; Append the text
+    (with-current-buffer (find-file-noselect file)
+      (goto-char (point-max))
+      (unless (bolp) (insert "\n"))
+      (insert text)
+      (unless (bolp) (insert "\n"))
+      (save-buffer))
+    (save-buffer)
+    (message "Moved to %s" (file-name-nondirectory file))))
+
+;;;###autoload
+(defun hord-scratch-list ()
+  "List unsorted scratch files in the minibuffer and open one."
+  (interactive)
+  (hord-scratch--ensure-dir)
+  (let* ((dir   (expand-file-name hord-scratch-directory))
+         (files (directory-files dir nil "\\.org\\'")))
+    (if (null files)
+        (message "No scratch files.")
+      (find-file (expand-file-name
+                  (completing-read "Scratch file: " files nil t)
+                  dir)))))
+
 ;; ── Keybinding ────────────────────────────────────────────
 
 ;;;###autoload
@@ -1260,6 +1382,12 @@ Works from any buffer (org-mode, hord reader, etc.)."
 
 ;;;###autoload
 (global-set-key (kbd "C-c W c") #'hord-lookup-cite-at-point)
+
+;;;###autoload
+(global-set-key (kbd "C-c W s") #'hord-scratch)
+
+;;;###autoload
+(global-set-key (kbd "C-c W S") #'hord-scratch-list)
 
 (provide 'hord)
 ;;; hord.el ends here

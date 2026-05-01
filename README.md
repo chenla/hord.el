@@ -29,6 +29,8 @@ Requires a compiled hord — run `hord compile` first.
 | `C-c W l`   | `hord-list`                | Browse all cards in a list     |
 | `C-c W r`   | `hord-suggest-rt`          | Suggest RT links for current card (org-mode) |
 | `C-c W c`   | `hord-lookup-cite-at-point`| Look up cite:key at point      |
+| `C-c W s`   | `hord-scratch`             | Open today's scratch pad       |
+| `C-c W S`   | `hord-scratch-list`        | Browse scratch files           |
 
 ### Card view
 
@@ -91,6 +93,26 @@ choose.  Use `C-c W c` to do the same lookup from any buffer
 Media files from `lib/blob/` are opened using external applications
 configured in `hord-external-viewers`.  Files whose extension is not
 in the list (e.g. `.md`, `.org`, `.txt`) open in Emacs.
+
+### Scratch pad
+
+`C-c W s` opens a daily scratch file (`YYYY-MM-DD.org`) for working
+notes.  On first open each day, pending items from the Orgzly inbox
+(synced via Syncthing) are automatically imported under a "Mobile
+inbox" heading.
+
+From a scratch buffer:
+
+| Key         | Action                          |
+|-------------|---------------------------------|
+| `C-c C-t`   | Move subtree to tomorrow's scratch file |
+
+Customizable paths:
+
+```elisp
+(setq hord-scratch-directory "~/proj/ybr/bench/scratch/")
+(setq hord-scratch-inbox-file "~/proj/org/gtd/inbox.org")
+```
 
 ## Requirements
 
