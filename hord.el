@@ -168,6 +168,8 @@ opened in Emacs (e.g. md, org, txt)."
 (defvar hord--incoming nil "Hash table: UUID → list of (predicate . source-uuid).")
 (defvar hord--citekeys nil "Hash table: citekey → UUID.")
 (defvar hord--citekeys-reverse nil "Hash table: UUID → citekey.")
+(defvar hord--tags nil "Hash table: UUID → list of tag strings.")
+(defvar hord--persona-annotations nil "Hash table: persona-name → (UUID → plist).")
 (defvar hord--loaded-root nil "Root that was last loaded.")
 
 (defun hord--ensure-loaded ()
@@ -178,10 +180,13 @@ opened in Emacs (e.g. md, org, txt)."
       (hord--load root))))
 
 (defun hord--load (root)
-  "Load the hord at ROOT into memory."
+  "Load the hord at ROOT into memory.
+Reads from overlay directories if they exist, falling back to
+legacy .hord/quads/ for backwards compatibility."
   (message "Loading hord from %s..." root)
   (let ((index-file (expand-file-name ".hord/index.tsv" root))
-        (quads-dir (expand-file-name ".hord/quads/" root)))
+        (overlays-dir (expand-file-name ".hord/overlays/" root))
+        (legacy-quads-dir (expand-file-name ".hord/quads/" root)))
     (unless (file-exists-p index-file)
       (error "No compiled hord at %s — run `hord compile' first" root))
     ;; Initialize tables
@@ -191,7 +196,9 @@ opened in Emacs (e.g. md, org, txt)."
           hord--types (make-hash-table :test 'equal)
           hord--authors (make-hash-table :test 'equal)
           hord--quads (make-hash-table :test 'equal)
-          hord--incoming (make-hash-table :test 'equal))
+          hord--incoming (make-hash-table :test 'equal)
+          hord--tags (make-hash-table :test 'equal)
+          hord--persona-annotations (make-hash-table :test 'equal))
     ;; Load index
     (with-temp-buffer
       (insert-file-contents index-file)
@@ -205,28 +212,44 @@ opened in Emacs (e.g. md, org, txt)."
               (puthash uuid path hord--index)
               (puthash path uuid hord--index-reverse))))
         (forward-line 1)))
-    ;; Load all quad files
-    (hord--load-quads quads-dir)
+    ;; Load quads from overlays or legacy directory
+    (if (file-directory-p overlays-dir)
+        (dolist (overlay-dir (directory-files overlays-dir t "^[^.]"))
+          (when (file-directory-p overlay-dir)
+            (let ((qdir (expand-file-name "quads" overlay-dir))
+                  (overlay-name (file-name-nondirectory overlay-dir)))
+              (when (file-directory-p qdir)
+                (hord--load-quads qdir overlay-name)))))
+      ;; Legacy: single quads directory
+      (when (file-directory-p legacy-quads-dir)
+        (hord--load-quads legacy-quads-dir nil)))
     ;; Build citekey index
     (hord--build-citekey-index root)
     (setq hord--loaded-root root)
-    (message "Loaded hord: %d entities, %d citekeys"
+    (message "Loaded hord: %d entities, %d citekeys, %d personas"
              (hash-table-count hord--index)
-             (hash-table-count hord--citekeys))))
+             (hash-table-count hord--citekeys)
+             (hash-table-count hord--persona-annotations))))
 
-(defun hord--load-quads (quads-dir)
-  "Load all quad files from QUADS-DIR."
+(defun hord--load-quads (quads-dir &optional overlay-name)
+  "Load all quad files from QUADS-DIR.
+OVERLAY-NAME is nil for legacy or the overlay directory name
+\(e.g. \"strata\", \"persona-researcher\")."
   (dolist (shard-dir (directory-files quads-dir t "^[0-9a-f]"))
     (when (file-directory-p shard-dir)
       (dolist (quad-file (directory-files shard-dir t "\\.tsv$"))
-        (hord--load-quad-file quad-file)))))
+        (hord--load-quad-file quad-file overlay-name)))))
 
-(defun hord--load-quad-file (filepath)
-  "Load quads from a single TSV FILEPATH."
+(defun hord--load-quad-file (filepath &optional overlay-name)
+  "Load quads from a single TSV FILEPATH.
+OVERLAY-NAME is used to route persona annotations to the right table."
   (with-temp-buffer
     (insert-file-contents filepath)
     (forward-line 1) ; skip header
-    (let (uuid quads)
+    (let (uuid quads
+          (persona (when (and overlay-name
+                              (string-prefix-p "persona-" overlay-name))
+                     (substring overlay-name 8))))
       (while (not (eobp))
         (let ((line (buffer-substring-no-properties
                      (line-beginning-position) (line-end-position))))
@@ -240,22 +263,38 @@ opened in Emacs (e.g. md, org, txt)."
               ;; Index title and type
               (cond
                ((string= p "v:title")
-                ;; Collapse multiline whitespace from bib imports
                 (puthash s (replace-regexp-in-string "[\n\t ]+" " " o) hord--titles))
                ((string= p "v:type") (puthash s o hord--types))
-               ((string= p "v:author") (puthash s o hord--authors)))
-              ;; Build incoming links index (skip PT, title, type)
+               ((string= p "v:author") (puthash s o hord--authors))
+               ;; Index tags
+               ((string= p "v:tag")
+                (puthash s (cons o (gethash s hord--tags nil)) hord--tags))
+               ;; Index persona annotations
+               ((and persona (string-prefix-p "v:p-" p))
+                (let* ((ptable (or (gethash persona hord--persona-annotations)
+                                   (let ((ht (make-hash-table :test 'equal)))
+                                     (puthash persona ht hord--persona-annotations)
+                                     ht)))
+                       (entry (or (gethash s ptable) (list))))
+                  (puthash s (plist-put entry (intern (concat ":" (substring p 4))) o)
+                           ptable))))
+              ;; Build incoming links index (skip PT, title, type, persona)
               (when (and (not (string= p "v:pt"))
                          (not (string= p "v:title"))
                          (not (string= p "v:type"))
                          (not (string= p "v:uf"))
+                         (not (string= p "v:tag"))
+                         (not (string-prefix-p "v:p-" p))
                          ;; Object looks like a UUID
                          (string-match-p "^[0-9a-f]\\{8\\}-" o))
                 (push (cons p s)
                       (gethash o hord--incoming nil))))))
         (forward-line 1))
       (when uuid
-        (puthash uuid (nreverse quads) hord--quads)))))
+        ;; Merge quads (overlays add to same entity)
+        (puthash uuid (append (gethash uuid hord--quads nil)
+                              (nreverse quads))
+                 hord--quads)))))
 
 (defun hord--build-citekey-index (root)
   "Build citekey → UUID index by scanning org files for :CITEKEY: properties."
@@ -772,17 +811,35 @@ Examples:
 
 (defun hord--parse-filter (filter-str)
   "Parse FILTER-STR into a plist of filter components.
-Returns (:types (list) :dirs (list) :authors (list) :terms (list) :cite t/nil).
-The special token @cite switches term matching to citekey mode."
-  (let (types dirs authors terms cite)
+Returns (:types :dirs :authors :terms :cite :tags :persona :priority :relevant).
+
+Prefixes:
+  @type   — entity type (con, per, wrk, cap, tag, persona, office)
+  @cite   — switch term matching to citekey mode
+  #author — author name
+  ~tag    — tag label
+  %name   — persona filter (only cards annotated by this persona)
+  !level  — priority filter (high, medium, low)
+  *       — only persona-relevant cards
+  +dir    — directory
+  text    — title (or citekey in @cite mode)"
+  (let (types dirs authors terms cite tags persona priority relevant)
     (dolist (token (split-string (string-trim filter-str)))
       (cond
        ((string= token "@cite")
         (setq cite t))
+       ((string= token "*")
+        (setq relevant t))
        ((string-prefix-p "@" token)
         (push (substring token 1) types))
        ((string-prefix-p "#" token)
         (push (downcase (substring token 1)) authors))
+       ((string-prefix-p "~" token)
+        (push (downcase (substring token 1)) tags))
+       ((string-prefix-p "%" token)
+        (setq persona (downcase (substring token 1))))
+       ((string-prefix-p "!" token)
+        (setq priority (downcase (substring token 1))))
        ((string-prefix-p "+" token)
         (push (substring token 1) dirs))
        ((not (string-empty-p token))
@@ -791,7 +848,11 @@ The special token @cite switches term matching to citekey mode."
           :dirs (nreverse dirs)
           :authors (nreverse authors)
           :terms (nreverse terms)
-          :cite cite)))
+          :cite cite
+          :tags (nreverse tags)
+          :persona persona
+          :priority priority
+          :relevant relevant)))
 
 (defun hord--entity-matches-filter (entity filter)
   "Test if ENTITY (uuid title type path) matches parsed FILTER.
@@ -804,7 +865,11 @@ When :cite is set in FILTER, terms match against citekeys instead of titles."
         (dirs (plist-get filter :dirs))
         (authors (plist-get filter :authors))
         (terms (plist-get filter :terms))
-        (cite (plist-get filter :cite)))
+        (cite (plist-get filter :cite))
+        (filter-tags (plist-get filter :tags))
+        (persona (plist-get filter :persona))
+        (priority (plist-get filter :priority))
+        (relevant (plist-get filter :relevant)))
     (and
      ;; Type filter: match short name or full vocab id
      (or (null types)
@@ -823,6 +888,38 @@ When :cite is set in FILTER, terms match against citekeys instead of titles."
            (seq-every-p (lambda (a)
                           (string-match-p (regexp-quote a) author))
                         authors)))
+     ;; Tag filter
+     (or (null filter-tags)
+         (let ((entity-tags (mapcar #'downcase (gethash uuid hord--tags nil))))
+           (seq-every-p (lambda (ft)
+                          (seq-some (lambda (et)
+                                     (string-match-p (regexp-quote ft) et))
+                                   entity-tags))
+                        filter-tags)))
+     ;; Persona filter: card must have annotations from this persona
+     (or (null persona)
+         (let ((ptable (gethash persona hord--persona-annotations)))
+           (and ptable (gethash uuid ptable))))
+     ;; Priority filter: card must have this priority in any persona
+     (or (null priority)
+         (let ((found nil))
+           (maphash (lambda (_pname ptable)
+                      (let ((entry (gethash uuid ptable)))
+                        (when (and entry
+                                   (string= (or (plist-get entry :priority) "")
+                                            priority))
+                          (setq found t))))
+                    hord--persona-annotations)
+           found))
+     ;; Relevant filter: card must be marked relevant in any persona
+     (or (not relevant)
+         (let ((found nil))
+           (maphash (lambda (_pname ptable)
+                      (let ((entry (gethash uuid ptable)))
+                        (when (and entry (plist-get entry :relevant))
+                          (setq found t))))
+                    hord--persona-annotations)
+           found))
      ;; Term filter: match title or citekey depending on mode
      (or (null terms)
          (if cite

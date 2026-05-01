@@ -70,10 +70,15 @@ Filter tokens are space-separated and ANDed together:
 | `@type`  | Card type            | `@con` concepts, `@wrk` works    |
 | `@cite`  | Switch to citekey mode | `@cite mann` citekeys matching "mann" |
 | `#text`  | Author               | `#alexander` `#braudel`          |
+| `~tag`   | Tag                  | `~tps` `~hoard`                  |
+| `%name`  | Persona              | `%researcher` `%musician`        |
+| `!level` | Priority             | `!high` `!medium` `!low`         |
+| `*`      | Relevant only        | cards marked relevant in any persona |
 | `+text`  | Directory            | `+capture` `+content`            |
 | `text`   | Title (or citekey with `@cite`) | `braudel economic`     |
 
-Examples: `@per alexander`, `@cite mann:2018`, `+capture @con`, `@wrk #scott`
+Examples: `@per alexander`, `@cite mann:2018`, `+capture @con`, `@wrk #scott`,
+`%researcher !high`, `~tps @con`, `* %researcher`
 
 ### Citation links
 
