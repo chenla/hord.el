@@ -169,6 +169,9 @@ opened in Emacs (e.g. md, org, txt)."
 (defvar hord--citekeys nil "Hash table: citekey → UUID.")
 (defvar hord--citekeys-reverse nil "Hash table: UUID → citekey.")
 (defvar hord--tags nil "Hash table: UUID → list of tag strings.")
+(defvar hord--statuses nil "Hash table: UUID → status string (todo/done/waiting).")
+(defvar hord--due-dates nil "Hash table: UUID → due date string (YYYY-MM-DD).")
+(defvar hord--scheduled-dates nil "Hash table: UUID → scheduled date string (YYYY-MM-DD).")
 (defvar hord--persona-annotations nil "Hash table: persona-name → (UUID → plist).")
 (defvar hord--loaded-root nil "Root that was last loaded.")
 
@@ -198,6 +201,9 @@ legacy .hord/quads/ for backwards compatibility."
           hord--quads (make-hash-table :test 'equal)
           hord--incoming (make-hash-table :test 'equal)
           hord--tags (make-hash-table :test 'equal)
+          hord--statuses (make-hash-table :test 'equal)
+          hord--due-dates (make-hash-table :test 'equal)
+          hord--scheduled-dates (make-hash-table :test 'equal)
           hord--persona-annotations (make-hash-table :test 'equal))
     ;; Load index
     (with-temp-buffer
@@ -269,6 +275,9 @@ OVERLAY-NAME is used to route persona annotations to the right table."
                ;; Index tags
                ((string= p "v:tag")
                 (puthash s (cons o (gethash s hord--tags nil)) hord--tags))
+               ((string= p "v:status") (puthash s o hord--statuses))
+               ((string= p "v:due") (puthash s o hord--due-dates))
+               ((string= p "v:scheduled") (puthash s o hord--scheduled-dates))
                ;; Index persona annotations
                ((and persona (string-prefix-p "v:p-" p))
                 (let* ((ptable (or (gethash persona hord--persona-annotations)
@@ -809,21 +818,49 @@ Examples:
   (setq tabulated-list-padding 1)
   (tabulated-list-init-header))
 
+(defun hord--date-in-range (date-str range)
+  "Test if DATE-STR (YYYY-MM-DD) falls within RANGE.
+RANGE is one of: today, week, month, overdue, all."
+  (if (null date-str)
+      nil
+    (if (string= range "all")
+        t
+      (let ((today (format-time-string "%Y-%m-%d")))
+        (cond
+         ((string= range "today")
+          (string= date-str today))
+         ((string= range "overdue")
+          (string< date-str today))
+         ((string= range "week")
+          (let ((week-end (format-time-string "%Y-%m-%d"
+                            (time-add (current-time) (* 7 86400)))))
+            (and (not (string< date-str today))
+                 (string<= date-str week-end))))
+         ((string= range "month")
+          (let ((month-end (format-time-string "%Y-%m-%d"
+                             (time-add (current-time) (* 30 86400)))))
+            (and (not (string< date-str today))
+                 (string<= date-str month-end))))
+         (t t))))))
+
 (defun hord--parse-filter (filter-str)
   "Parse FILTER-STR into a plist of filter components.
 Returns (:types :dirs :authors :terms :cite :tags :persona :priority :relevant).
 
 Prefixes:
-  @type   — entity type (con, per, wrk, cap, tag, persona, office)
+  @type   — entity type (con, per, wrk, cap, tag, persona, office, task, event)
   @cite   — switch term matching to citekey mode
   #author — author name
   ~tag    — tag label
   %name   — persona filter (only cards annotated by this persona)
   !level  — priority filter (high, medium, low)
   *       — only persona-relevant cards
+  =status — task status (todo, done, waiting, cancelled)
+  /range  — time range (today, week, month, overdue, all)
   +dir    — directory
   text    — title (or citekey in @cite mode)"
-  (let (types dirs authors terms cite tags persona priority relevant)
+  (let (types dirs authors terms cite tags persona priority relevant
+        status time-range)
     (dolist (token (split-string (string-trim filter-str)))
       (cond
        ((string= token "@cite")
@@ -840,6 +877,10 @@ Prefixes:
         (setq persona (downcase (substring token 1))))
        ((string-prefix-p "!" token)
         (setq priority (downcase (substring token 1))))
+       ((string-prefix-p "=" token)
+        (setq status (downcase (substring token 1))))
+       ((string-prefix-p "/" token)
+        (setq time-range (downcase (substring token 1))))
        ((string-prefix-p "+" token)
         (push (substring token 1) dirs))
        ((not (string-empty-p token))
@@ -852,7 +893,9 @@ Prefixes:
           :tags (nreverse tags)
           :persona persona
           :priority priority
-          :relevant relevant)))
+          :relevant relevant
+          :status status
+          :time-range time-range)))
 
 (defun hord--entity-matches-filter (entity filter)
   "Test if ENTITY (uuid title type path) matches parsed FILTER.
@@ -869,7 +912,9 @@ When :cite is set in FILTER, terms match against citekeys instead of titles."
         (filter-tags (plist-get filter :tags))
         (persona (plist-get filter :persona))
         (priority (plist-get filter :priority))
-        (relevant (plist-get filter :relevant)))
+        (relevant (plist-get filter :relevant))
+        (status (plist-get filter :status))
+        (time-range (plist-get filter :time-range)))
     (and
      ;; Type filter: match short name or full vocab id
      (or (null types)
@@ -920,6 +965,16 @@ When :cite is set in FILTER, terms match against citekeys instead of titles."
                           (setq found t))))
                     hord--persona-annotations)
            found))
+     ;; Status filter
+     (or (null status)
+         (let ((entity-status (gethash uuid hord--statuses)))
+           (and entity-status
+                (string= (downcase entity-status) status))))
+     ;; Time range filter (checks due or scheduled date)
+     (or (null time-range)
+         (let ((due-date (gethash uuid hord--due-dates))
+               (sched-date (gethash uuid hord--scheduled-dates)))
+           (hord--date-in-range (or due-date sched-date) time-range)))
      ;; Term filter: match title or citekey depending on mode
      (or (null terms)
          (if cite

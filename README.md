@@ -74,11 +74,14 @@ Filter tokens are space-separated and ANDed together:
 | `%name`  | Persona              | `%researcher` `%musician`        |
 | `!level` | Priority             | `!high` `!medium` `!low`         |
 | `*`      | Relevant only        | cards marked relevant in any persona |
+| `=status`| Task status          | `=todo` `=done` `=waiting`       |
+| `/range` | Time range           | `/today` `/week` `/month` `/overdue` |
 | `+text`  | Directory            | `+capture` `+content`            |
 | `text`   | Title (or citekey with `@cite`) | `braudel economic`     |
 
 Examples: `@per alexander`, `@cite mann:2018`, `+capture @con`, `@wrk #scott`,
-`%researcher !high`, `~tps @con`, `* %researcher`
+`%researcher !high`, `~tps @con`, `* %researcher`,
+`=todo /week`, `@task =todo %researcher /month`
 
 ### Citation links
 
