@@ -402,7 +402,9 @@ OVERLAY-NAME is used to route persona annotations to the right table."
                           bib-fields))
                   (push (cons "BIB-DATA" (nreverse bib-fields)) result))))))
         ;; Notes section body — try explicit ** Notes first,
-        ;; then fall back to body text between :END: and first ** heading
+        ;; then fall back to body text between :END: and first ** heading.
+        ;; Captures everything from ** Notes to ** References (inclusive of
+        ;; sub-headings like ** Usage, *** Examples, etc.)
         (goto-char (point-min))
         (let ((notes-found (re-search-forward "^\\*\\* Notes" nil t)))
           (if notes-found
@@ -410,31 +412,50 @@ OVERLAY-NAME is used to route persona annotations to the right table."
                 (forward-line 1)
                 (let ((body-start (point))
                       (body-end (or (save-excursion
-                                      (when (re-search-forward "^\\*+ " nil t)
+                                      (when (re-search-forward
+                                             "^\\*\\*? References" nil t)
                                         (line-beginning-position)))
                                     (point-max))))
                   (let ((body (string-trim
                                (buffer-substring-no-properties
                                 body-start body-end))))
+                    ;; Strip property drawers within notes section
+                    (setq body (replace-regexp-in-string
+                                "\\s-*:PROPERTIES:.*?:END:\\s*\n?" "" body))
                     (unless (string-empty-p body)
                       (push (cons "BODY" body) result)))))
-            ;; Fallback: grab text between first :END: and first ** heading,
-            ;; skipping relation lines (- XX ::) and org directives (#+)
+            ;; Fallback: grab text between first :END: and ** References,
+            ;; skipping relation lines (- XX ::) and file-level directives
             (goto-char (point-min))
             (when (re-search-forward "^\\s-*:END:" nil t)
               (forward-line 1)
               (let ((body-start (point))
                     (body-end (or (save-excursion
-                                    (when (re-search-forward "^\\*\\* " nil t)
+                                    (when (re-search-forward
+                                           "^\\*\\*? References" nil t)
                                       (line-beginning-position)))
                                   (point-max))))
                 (let ((raw (buffer-substring-no-properties body-start body-end)))
-                  ;; Strip relation lines and org directives
+                  ;; Extract SEE lines BEFORE stripping relations
+                  (let ((see-links nil))
+                    (with-temp-buffer
+                      (insert raw)
+                      (goto-char (point-min))
+                      (while (re-search-forward
+                              "^\\s-*- SEE ::\\s-*\\(.*\\)" nil t)
+                        (push (match-string 1) see-links)))
+                    (when see-links
+                      (push (cons "SEE" (string-join (nreverse see-links) "\n"))
+                            result)))
+                  ;; Strip relation lines including SEE
                   (setq raw (replace-regexp-in-string
-                             "^\\s-*- [A-Z]+ ::.*\n?" "" raw))
+                             "^\\s-*- [A-Z]+\\s-+::.*\n?" "" raw))
+                  ;; Strip file-level directives but NOT block delimiters
                   (setq raw (replace-regexp-in-string
-                             "^#\\+.*\n?" "" raw))
-                  (setq raw (string-trim raw))
+                             "^#\\+\\(TITLE\\|STARTUP\\|FILETAGS\\|ROAM_\\|bibliography\\).*\n?" "" raw))
+                  ;; Trim trailing whitespace but preserve leading indentation
+                  (setq raw (replace-regexp-in-string "\\`\n+" "" raw))
+                  (setq raw (replace-regexp-in-string "\\s-+\\'" "" raw))
                   (unless (string-empty-p raw)
                     (push (cons "BODY" raw) result)))))))
         ;; References section (** or * level)
@@ -446,13 +467,15 @@ OVERLAY-NAME is used to route persona annotations to the right table."
                                (when (re-search-forward "^\\*\\* " nil t)
                                  (line-beginning-position)))
                              (point-max))))
-            (let ((refs (string-trim
-                         (buffer-substring-no-properties
-                          ref-start ref-end))))
+            (let ((refs (buffer-substring-no-properties
+                         ref-start ref-end)))
               ;; Strip bibliography: lines
               (setq refs (replace-regexp-in-string
                           "^[ \t]*bibliography:.*\n?" "" refs))
-              (setq refs (string-trim refs))
+              ;; Strip leading blank lines, preserve indentation on first content line
+              (setq refs (replace-regexp-in-string "\\`\n+" "" refs))
+              ;; Trim trailing whitespace
+              (setq refs (replace-regexp-in-string "\\s-+\\'" "" refs))
               (unless (string-empty-p refs)
                 (push (cons "REFS" refs) result)))))
         result))))
@@ -708,7 +731,31 @@ Gathers all available targets and presents a menu if more than one."
         (insert (propertize "── Notes " 'face 'hord-section-header)
                 (propertize (make-string 47 ?─) 'face 'hord-section-header)
                 "\n")
-        (hord--insert-with-cite-links body)
+        (hord--insert-body-with-blocks body)
+        (insert "\n\n")))
+
+    ;; See Also (from SEE :: lines)
+    (let ((see (cdr (assoc "SEE" meta))))
+      (when see
+        (insert (propertize "── See Also " 'face 'hord-section-header)
+                (propertize (make-string 44 ?─) 'face 'hord-section-header)
+                "\n")
+        ;; Parse [[id:UUID][Label]] links and render as clickable buttons
+        (let ((pos 0))
+          (while (string-match
+                  "\\[\\[id:\\([0-9a-f-]+\\)\\]\\[\\([^]]+\\)\\]\\]"
+                  see pos)
+            (let ((before (substring see pos (match-beginning 0)))
+                  (uid (match-string 1 see))
+                  (label (match-string 2 see)))
+              (when (> (length before) 0)
+                (insert before))
+              (insert "  ")
+              (hord--insert-link uid label)
+              (setq pos (match-end 0))))
+          ;; Insert any remaining text after last match
+          (when (< pos (length see))
+            (insert (substring see pos))))
         (insert "\n\n")))
 
     ;; References
@@ -716,11 +763,55 @@ Gathers all available targets and presents a menu if more than one."
       (when refs
         (insert (propertize "── References " 'face 'hord-section-header)
                 (propertize (make-string 42 ?─) 'face 'hord-section-header)
-                "\n")
+                "\n\n")
         (hord--insert-with-cite-links refs)
         (insert "\n")))
 
     (goto-char (point-min))))
+
+(defun hord--insert-body-with-blocks (body)
+  "Insert BODY text, rendering org blocks and sub-headings.
+Handles #+begin_quote/#+end_quote, #+begin_example/#+end_example,
+#+begin_src/#+end_src, and ** / *** sub-headings within the notes
+section."
+  (let ((lines (split-string body "\n"))
+        (in-block nil)
+        (block-type nil))
+    (dolist (line lines)
+      (cond
+       ;; Start of a block
+       ((string-match "^#\\+begin_\\(quote\\|example\\|src\\)" line)
+        (setq in-block t
+              block-type (match-string 1 line))
+        (insert "\n"))
+       ;; End of a block
+       ((string-match "^#\\+end_\\(quote\\|example\\|src\\)" line)
+        (setq in-block nil
+              block-type nil)
+        (insert "\n"))
+       ;; Inside a block — indent and style
+       (in-block
+        (cond
+         ((string= block-type "quote")
+          (insert (propertize (concat "    │ " line)
+                              'face 'font-lock-comment-face)
+                  "\n"))
+         ((member block-type '("example" "src"))
+          (insert (propertize (concat "    " line)
+                              'face 'font-lock-string-face)
+                  "\n"))))
+       ;; Sub-headings (** or ***) rendered as section labels
+       ((string-match "^\\*\\*\\*? \\(.+\\)" line)
+        (let ((heading (match-string 1 line)))
+          (insert "\n"
+                  (propertize (concat "── " heading " ")
+                              'face 'hord-section-header)
+                  (propertize (make-string (max 0 (- 53 (length heading))) ?─)
+                              'face 'hord-section-header)
+                  "\n")))
+       ;; Normal text — insert with cite links
+       (t
+        (hord--insert-with-cite-links (concat line "\n")))))))
 
 (defun hord--insert-meta (key value)
   "Insert a metadata KEY: VALUE line."
