@@ -769,11 +769,37 @@ Gathers all available targets and presents a menu if more than one."
 
     (goto-char (point-min))))
 
+(defun hord--insert-org-inline (text)
+  "Insert TEXT with org inline markup rendered as faces.
+Handles /italic/, *bold*, =code=, and ~verbatim~."
+  (let ((start 0))
+    (while (string-match
+            (concat
+             "\\(/\\([^/\n]+\\)/\\)"     ;; group 1,2: /italic/
+             "\\|"
+             "\\(\\*\\([^*\n]+\\)\\*\\)" ;; group 3,4: *bold*
+             "\\|"
+             "\\([=~]\\([^=~\n]+\\)[=~]\\)") ;; group 5,6: =code= or ~verb~
+            text start)
+      (let ((before (substring text start (match-beginning 0))))
+        (hord--insert-with-cite-links before))
+      (cond
+       ((match-string 2 text)
+        (insert (propertize (match-string 2 text) 'face 'italic)))
+       ((match-string 4 text)
+        (insert (propertize (match-string 4 text) 'face 'bold)))
+       ((match-string 6 text)
+        (insert (propertize (match-string 6 text) 'face 'font-lock-constant-face))))
+      (setq start (match-end 0)))
+    ;; Remaining text
+    (when (< start (length text))
+      (hord--insert-with-cite-links (substring text start)))))
+
 (defun hord--insert-body-with-blocks (body)
   "Insert BODY text, rendering org blocks and sub-headings.
 Handles #+begin_quote/#+end_quote, #+begin_example/#+end_example,
 #+begin_src/#+end_src, and ** / *** sub-headings within the notes
-section."
+section.  Inline markup (/italic/, *bold*, =code=) is rendered."
   (let ((lines (split-string body "\n"))
         (in-block nil)
         (block-type nil))
@@ -809,9 +835,9 @@ section."
                   (propertize (make-string (max 0 (- 53 (length heading))) ?─)
                               'face 'hord-section-header)
                   "\n")))
-       ;; Normal text — insert with cite links
+       ;; Normal text — insert with inline markup and cite links
        (t
-        (hord--insert-with-cite-links (concat line "\n")))))))
+        (hord--insert-org-inline (concat line "\n")))))))
 
 (defun hord--insert-meta (key value)
   "Insert a metadata KEY: VALUE line."
