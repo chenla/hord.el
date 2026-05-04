@@ -1557,8 +1557,8 @@ Works from any buffer (org-mode, hord reader, etc.)."
   :type 'directory
   :group 'hord)
 
-(defcustom hord-scratch-inbox-file "~/proj/org/gtd/inbox.org"
-  "Orgzly inbox file synced via Syncthing."
+(defcustom hord-scratch-inbox-file "~/proj/ybr/bench/scratch/inbox/scratch.org"
+  "Mobile inbox file synced via Markor + Syncthing (one-way)."
   :type 'file
   :group 'hord)
 
@@ -1579,41 +1579,37 @@ Works from any buffer (org-mode, hord reader, etc.)."
            "#+TITLE: Scratch — %A %e %B %Y\n\n** " date))
   (save-buffer))
 
+(defvar hord-scratch--inbox-last-size 0
+  "Byte size of inbox file at last import.
+Used to detect new content without clearing the file
+\(since one-way Syncthing means the phone will overwrite
+any clears\).")
+
 (defun hord-scratch--import-inbox ()
-  "Import pending items from Orgzly inbox into current scratch buffer.
-Moves non-DONE top-level headings from `hord-scratch-inbox-file'
-into the scratch buffer under a Mobile Inbox heading, then removes
-them from the inbox file.  DONE items are left in place."
+  "Import new items from mobile inbox into current scratch buffer.
+Only imports content added since the last import, tracked by file
+size.  Does not clear the inbox file (phone is send-only and would
+overwrite any clears)."
   (let* ((inbox (expand-file-name hord-scratch-inbox-file))
-         items)
-    (when (and (file-exists-p inbox)
-               (> (file-attribute-size (file-attributes inbox)) 0))
-      ;; Collect non-DONE headings from inbox
-      (with-current-buffer (find-file-noselect inbox)
-        (org-with-wide-buffer
-         (goto-char (point-min))
-         (while (re-search-forward "^\\* " nil t)
-           (let ((element (org-element-at-point)))
-             (when (not (org-element-property :todo-keyword element))
-               (let ((beg (org-element-property :begin element))
-                     (end (org-element-property :end element)))
-                 (push (buffer-substring-no-properties beg end) items)))))
-         ;; Remove collected items (reverse so positions stay valid)
-         (dolist (item (reverse items))
-           (goto-char (point-min))
-           (when (search-forward item nil t)
-             (delete-region (match-beginning 0) (match-end 0))))
-         (when items (save-buffer))))
-      ;; Append to scratch
-      (when items
-        (goto-char (point-max))
-        (unless (bolp) (insert "\n"))
-        (insert "\n** Mobile inbox [" (format-time-string "%Y-%m-%d %a %H:%M") "]\n\n")
-        (dolist (item (nreverse items))
-          ;; Demote: top-level * becomes ** so they nest under Mobile inbox
-          (insert (replace-regexp-in-string "^\\* " "*** " item)))
-        (save-buffer)
-        (message "Imported %d item(s) from inbox" (length items))))))
+         (size (and (file-exists-p inbox)
+                    (file-attribute-size (file-attributes inbox)))))
+    (when (and size (> size hord-scratch--inbox-last-size))
+      (let ((content (with-temp-buffer
+                       (insert-file-contents inbox nil
+                                            hord-scratch--inbox-last-size size)
+                       (string-trim (buffer-string)))))
+        (when (not (string-empty-p content))
+          ;; Append to scratch
+          (goto-char (point-max))
+          (unless (bolp) (insert "\n"))
+          (insert "\n** Mobile inbox ["
+                  (format-time-string "%Y-%m-%d %a %H:%M")
+                  "]\n\n"
+                  content "\n")
+          (save-buffer)
+          (message "Imported %d bytes from mobile inbox"
+                   (- size hord-scratch--inbox-last-size))))
+      (setq hord-scratch--inbox-last-size size))))
 
 ;;;###autoload
 (defun hord-scratch ()
