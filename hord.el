@@ -92,10 +92,17 @@ opened in Emacs (e.g. md, org, txt)."
     ("v:rt"   . "RT")
     ("v:uf"   . "UF")
     ("v:use"  . "USE")
-    ("v:s-wo" . "WO")
-    ("v:s-eo" . "EO")
-    ("v:s-mo" . "MO")
-    ("v:s-io" . "IO"))
+    ("v:tag"  . "Tag")
+    ("v:author" . "Author")
+    ("v:citekey" . "Citekey")
+    ("v:status" . "Status")
+    ("v:due"    . "Due")
+    ("v:scheduled" . "Sched")
+    ("v:s-wo" . "Whole")
+    ("v:s-eo" . "Expr")
+    ("v:s-mo" . "Manif")
+    ("v:s-io" . "Inst")
+    ("v:s-type" . "WEMI"))
   "Mapping from vocab predicate IDs to display labels."
   :type '(alist :key-type string :value-type string)
   :group 'hord)
@@ -646,25 +653,52 @@ Gathers all available targets and presents a menu if more than one."
       (when geo (hord--insert-meta "Location" geo)))
     (insert "\n")
 
-    ;; Relations (outgoing)
-    (let ((rels (seq-filter
-                 (lambda (q)
-                   (and (not (string= (hord-quad-predicate q) "v:type"))
-                        (not (string= (hord-quad-predicate q) "v:title"))
-                        (not (string= (hord-quad-predicate q) "v:pt"))))
-                 quads)))
-      (when rels
+    ;; Separate quads into structural and strata
+    (let ((structural nil)
+          (strata nil)
+          (hidden '("v:type" "v:title" "v:pt"))
+          (strata-preds '("v:author" "v:citekey" "v:status" "v:due"
+                          "v:scheduled" "v:s-wo" "v:s-eo" "v:s-mo"
+                          "v:s-io" "v:s-type")))
+      (dolist (q quads)
+        (let ((pred (hord-quad-predicate q)))
+          (unless (member pred hidden)
+            (if (member pred strata-preds)
+                (push q strata)
+              (push q structural)))))
+
+      ;; Structural relations (thesaurus)
+      (when structural
         (insert (propertize "── Relations " 'face 'hord-section-header)
                 (propertize (make-string 43 ?─) 'face 'hord-section-header)
                 "\n")
-        (dolist (q rels)
+        (dolist (q (nreverse structural))
           (let* ((pred (hord-quad-predicate q))
                  (obj (hord-quad-object q))
                  (label (hord--relation-label pred))
                  (is-uuid (string-match-p "^[0-9a-f]\\{8\\}-" obj)))
             (insert "  "
-                    (propertize (format "%-4s" label) 'face 'hord-relation-type)
-                    " → ")
+                    (propertize (format "%-7s" label) 'face 'hord-relation-type)
+                    " ")
+            (if is-uuid
+                (hord--insert-link obj (hord--title-for-uuid obj))
+              (insert obj))
+            (insert "\n")))
+        (insert "\n"))
+
+      ;; Strata (identity / WEMI)
+      (when strata
+        (insert (propertize "── Identity " 'face 'hord-section-header)
+                (propertize (make-string 44 ?─) 'face 'hord-section-header)
+                "\n")
+        (dolist (q (nreverse strata))
+          (let* ((pred (hord-quad-predicate q))
+                 (obj (hord-quad-object q))
+                 (label (hord--relation-label pred))
+                 (is-uuid (string-match-p "^[0-9a-f]\\{8\\}-" obj)))
+            (insert "  "
+                    (propertize (format "%-7s" label) 'face 'hord-metadata-key)
+                    " ")
             (if is-uuid
                 (hord--insert-link obj (hord--title-for-uuid obj))
               (insert obj))
