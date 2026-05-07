@@ -903,12 +903,18 @@ section.  Inline markup (/italic/, *bold*, =code=) is rendered."
     (define-key map (kbd "s")   #'hord-list-and-filter)
     (define-key map (kbd "t")   #'hord-list-type)
     (define-key map (kbd "g")   #'hord-refresh)
-    (define-key map (kbd "q")   #'quit-window)
+    (define-key map (kbd "q")   #'hord-quit)
     (define-key map (kbd "?")   #'hord-help)
     (define-key map (kbd "TAB") #'forward-button)
     (define-key map (kbd "<backtab>") #'backward-button)
     map)
   "Keymap for `hord-card-mode'.")
+
+(defun hord-quit ()
+  "Quit the current hord buffer, burying instead of killing.
+Returns to the previous buffer (e.g. agenda or list)."
+  (interactive)
+  (quit-window nil))
 
 (define-derived-mode hord-card-mode special-mode "Hord"
   "Major mode for viewing Hoard cards.
@@ -1562,6 +1568,12 @@ Works from any buffer (org-mode, hord reader, etc.)."
   :type 'file
   :group 'hord)
 
+(defcustom hord-readwise-fetch-script
+  "~/proj/hord.el/readwise-fetch.py"
+  "Path to the Readwise highlight fetch script."
+  :type 'file
+  :group 'hord)
+
 (defun hord-scratch--file-for-date (date)
   "Return the scratch file path for DATE (a time value)."
   (expand-file-name (format-time-string "%Y-%m-%d.org" date)
@@ -1611,11 +1623,30 @@ overwrite any clears)."
                    (- size hord-scratch--inbox-last-size))))
       (setq hord-scratch--inbox-last-size size))))
 
+(defun hord-scratch--import-readwise ()
+  "Import new Readwise highlights into current scratch buffer.
+Calls the fetch script, which tracks its own sync state."
+  (let* ((script (expand-file-name hord-readwise-fetch-script))
+         (content (when (file-exists-p script)
+                    (string-trim
+                     (shell-command-to-string
+                      (format "python3 %s 2>/dev/null"
+                              (shell-quote-argument script)))))))
+    (when (and content (not (string-empty-p content)))
+      (goto-char (point-max))
+      (unless (bolp) (insert "\n"))
+      (insert "\n** Readwise highlights ["
+              (format-time-string "%Y-%m-%d %a %H:%M")
+              "]\n\n"
+              content "\n")
+      (save-buffer)
+      (message "Imported Readwise highlights"))))
+
 ;;;###autoload
 (defun hord-scratch ()
   "Open today's scratch pad.
 Creates the file and directory if needed.  Automatically imports
-any pending items from the Orgzly inbox."
+any pending items from the Orgzly inbox and new Readwise highlights."
   (interactive)
   (hord-scratch--ensure-dir)
   (let* ((today (current-time))
@@ -1623,7 +1654,8 @@ any pending items from the Orgzly inbox."
     (find-file file)
     (when (= (buffer-size) 0)
       (hord-scratch--init-buffer file today))
-    (hord-scratch--import-inbox)))
+    (hord-scratch--import-inbox)
+    (hord-scratch--import-readwise)))
 
 ;;;###autoload
 (defun hord-scratch-tomorrow ()
@@ -1775,6 +1807,531 @@ Writes directly to the current org buffer and saves."
                         "--no-reciprocal")))
       (message "Added %s → %s" rel-type target-label))))
 
+;; ── Agenda ───────────────────────────────────────────────
+
+(defface hord-agenda-overdue
+  '((t :inherit error))
+  "Face for overdue items in hord-agenda."
+  :group 'hord)
+
+(defface hord-agenda-today
+  '((t :inherit success))
+  "Face for today's items in hord-agenda."
+  :group 'hord)
+
+(defface hord-agenda-upcoming
+  '((t :inherit font-lock-comment-face))
+  "Face for upcoming items in hord-agenda."
+  :group 'hord)
+
+(defface hord-agenda-section
+  '((t :inherit info-title-3 :weight bold))
+  "Face for section headers in hord-agenda."
+  :group 'hord)
+
+(defvar hord-agenda-mode-map
+  (let ((map (make-sparse-keymap)))
+    (set-keymap-parent map tabulated-list-mode-map)
+    (define-key map (kbd "RET") #'hord-agenda-open)
+    (define-key map (kbd "e")   #'hord-agenda-edit)
+    (define-key map (kbd "d")   #'hord-agenda-mark-done)
+    (define-key map (kbd "g")   #'hord-agenda-refresh)
+    (define-key map (kbd "v")   #'hord-agenda-view-card)
+    (define-key map (kbd "w")   #'hord-agenda-week)
+    (define-key map (kbd "m")   #'hord-agenda-month)
+    (define-key map (kbd "f")   #'hord-agenda-filter)
+    (define-key map (kbd "/")   #'hord-agenda-toggle-all)
+    (define-key map (kbd "q")   #'quit-window)
+    map)
+  "Keymap for `hord-agenda-mode'.")
+
+(defvar-local hord-agenda--range "week"
+  "Current time range for agenda display.")
+
+(defvar-local hord-agenda--filter nil
+  "Optional additional filter string for agenda.")
+
+(defvar-local hord-agenda--show-all nil
+  "When non-nil, show done/waiting/delegated items too.")
+
+(defcustom hord-agenda-col-status 8
+  "Width of the Status column in hord-agenda."
+  :type 'integer :group 'hord)
+
+(defcustom hord-agenda-col-date 12
+  "Width of the Date column in hord-agenda."
+  :type 'integer :group 'hord)
+
+(defcustom hord-agenda-col-type 14
+  "Width of the Type column in hord-agenda."
+  :type 'integer :group 'hord)
+
+(defcustom hord-agenda-col-title 55
+  "Width of the Title column in hord-agenda."
+  :type 'integer :group 'hord)
+
+(define-derived-mode hord-agenda-mode tabulated-list-mode "Hord-Agenda"
+  "Major mode for viewing scheduled/due hord cards.
+
+Displays cards with due or scheduled dates, grouped by urgency.
+
+Keys:
+  RET — open card in hord-view
+  e   — edit source org file
+  d   — mark task done
+  v   — view card detail
+  w   — show this week
+  m   — show this month
+  g   — refresh
+  f   — filter by text/tag
+  q   — quit
+
+\\{hord-agenda-mode-map}"
+  (setq tabulated-list-format
+        (vector '("" 1 nil)
+                `("Status" ,hord-agenda-col-status t)
+                `("Date" ,hord-agenda-col-date t)
+                `("Type" ,hord-agenda-col-type t)
+                `("Title" ,hord-agenda-col-title t)))
+  (setq truncate-lines t)
+  (setq tabulated-list-sort-key '("Date" . nil))
+  (setq tabulated-list-padding 1)
+  (tabulated-list-init-header))
+
+(defvar hord-agenda--hidden-statuses '("done" "waiting" "delegated")
+  "Statuses hidden from agenda by default. Shown when `hord-agenda--show-all' is t.")
+
+(defvar hord-agenda-gcal-script
+  (expand-file-name "gcal-fetch.py"
+                    (file-name-directory (or load-file-name buffer-file-name "")))
+  "Path to the gcal-fetch.py script.")
+
+(defvar hord-agenda--gcal-cache nil
+  "Cached gcal entries as (timestamp . entries).")
+
+(defvar hord-agenda-gcal-cache-seconds 300
+  "How long to cache gcal results (default 5 minutes).")
+
+(defun hord-agenda--collect-gcal (days)
+  "Collect Google Calendar events for the next DAYS days.
+Returns list of (id title type status date date-kind) matching
+the shape of `hord-agenda--collect'."
+  (when (file-executable-p hord-agenda-gcal-script)
+    ;; Return cache if fresh
+    (if (and hord-agenda--gcal-cache
+             (< (- (float-time) (car hord-agenda--gcal-cache))
+                hord-agenda-gcal-cache-seconds))
+        (cdr hord-agenda--gcal-cache)
+    (let ((output (shell-command-to-string
+                   (format "python3 %s %d 2>/dev/null"
+                           (shell-quote-argument hord-agenda-gcal-script)
+                           days)))
+          entries)
+      (dolist (line (split-string output "\n" t))
+        (let ((fields (split-string line "\t")))
+          (when (>= (length fields) 4)
+            (let* ((date (nth 0 fields))
+                   (time (nth 1 fields))
+                   (summary (nth 2 fields))
+                   (cal (nth 3 fields))
+                   (id (concat "gcal:" date ":" summary))
+                   (title (if (string= time "all-day")
+                              summary
+                            (concat time " " summary))))
+              (push (list id title cal "" date "gcal") entries)))))
+      (setq hord-agenda--gcal-cache (cons (float-time) (nreverse entries)))
+      (cdr hord-agenda--gcal-cache)))))
+
+
+(defun hord-agenda--collect ()
+  "Collect agenda entries: cards with due or scheduled dates.
+Returns list of (uuid title type status date date-kind)."
+  (hord--ensure-loaded)
+  (let (entries)
+    ;; Collect items with due dates
+    (maphash (lambda (uuid date)
+               (let ((status (or (gethash uuid hord--statuses) ""))
+                     (title (or (gethash uuid hord--titles) "(untitled)"))
+                     (type (or (gethash uuid hord--types) "unknown")))
+                 (when (or hord-agenda--show-all
+                           (not (member (downcase status)
+                                        hord-agenda--hidden-statuses)))
+                   (push (list uuid title type status date "due") entries))))
+             hord--due-dates)
+    ;; Collect items with scheduled dates (skip if already have due date)
+    (maphash (lambda (uuid date)
+               (unless (gethash uuid hord--due-dates)
+                 (let ((status (or (gethash uuid hord--statuses) ""))
+                       (title (or (gethash uuid hord--titles) "(untitled)"))
+                       (type (or (gethash uuid hord--types) "unknown")))
+                   (when (or hord-agenda--show-all
+                             (not (member (downcase status)
+                                          hord-agenda--hidden-statuses)))
+                     (push (list uuid title type status date "sched") entries)))))
+             hord--scheduled-dates)
+    entries))
+
+(defun hord-agenda--classify-date (date-str)
+  "Classify DATE-STR as overdue, today, or upcoming."
+  (let ((today (format-time-string "%Y-%m-%d")))
+    (cond
+     ((string< date-str today) 'overdue)
+     ((string= date-str today) 'today)
+     (t 'upcoming))))
+
+(defun hord-agenda--in-range-p (date-str range)
+  "Check if DATE-STR falls within RANGE (week, month, all)."
+  (cond
+   ((string= range "all") t)
+   ((string= range "week")
+    (let ((end (format-time-string "%Y-%m-%d"
+                (time-add (current-time) (* 7 86400)))))
+      (not (string< end date-str))))
+   ((string= range "month")
+    (let ((end (format-time-string "%Y-%m-%d"
+                (time-add (current-time) (* 30 86400)))))
+      (not (string< end date-str))))
+   (t t)))
+
+(defun hord-agenda--build-entries ()
+  "Build tabulated-list entries for the agenda buffer."
+  (let* ((raw (append (hord-agenda--collect)
+                      (hord-agenda--collect-gcal
+                       (cond ((string= hord-agenda--range "week") 7)
+                             ((string= hord-agenda--range "month") 30)
+                             (t 90)))))
+         (range hord-agenda--range)
+         (filter-str (or hord-agenda--filter ""))
+         (filtered (seq-filter
+                    (lambda (e)
+                      (let ((date (nth 4 e))
+                            (title (downcase (nth 1 e))))
+                        (and (hord-agenda--in-range-p date range)
+                             (or (string-empty-p filter-str)
+                                 (string-match-p
+                                  (regexp-quote (downcase filter-str))
+                                  title)))))
+                    raw))
+         ;; Sort: overdue first, then today, then by date ascending
+         (sorted (sort filtered
+                       (lambda (a b)
+                         (string< (nth 4 a) (nth 4 b))))))
+    (mapcar
+     (lambda (e)
+       (let* ((uuid (nth 0 e))
+              (title (nth 1 e))
+              (type (nth 2 e))
+              (status (nth 3 e))
+              (date (nth 4 e))
+              (date-kind (nth 5 e))
+              (class (hord-agenda--classify-date date))
+              (marker (cond
+                       ((eq class 'overdue) "!")
+                       ((eq class 'today) ">")
+                       (t " ")))
+              (date-face (cond
+                          ((eq class 'overdue) 'hord-agenda-overdue)
+                          ((eq class 'today) 'hord-agenda-today)
+                          (t 'hord-agenda-upcoming)))
+              (date-display (concat date
+                                    (if (string= date-kind "sched") " S" ""))))
+         (list uuid
+               (vector
+                (propertize marker 'face date-face)
+                (propertize (or status "") 'face 'hord-metadata-value)
+                (propertize date-display 'face date-face)
+                (hord--type-label type)
+                title))))
+     sorted)))
+
+(defun hord-agenda--update ()
+  "Refresh the agenda display."
+  (when (derived-mode-p 'hord-agenda-mode)
+    (let ((pos (point)))
+      (setq tabulated-list-entries (hord-agenda--build-entries))
+      (tabulated-list-print)
+      (goto-char (min pos (point-max)))
+      (setq header-line-format
+            (format " Hord Agenda [%s]%s — %d items%s"
+                    hord-agenda--range
+                    (if hord-agenda--show-all " +all" "")
+                    (length tabulated-list-entries)
+                    (if hord-agenda--filter
+                        (format " (filter: %s)" hord-agenda--filter)
+                      ""))))))
+
+;;;###autoload
+(defun hord-agenda ()
+  "Open the hord agenda view showing scheduled and due items."
+  (interactive)
+  (hord--ensure-loaded)
+  (let ((buf (get-buffer-create "*hord-agenda*")))
+    (switch-to-buffer buf)
+    (unless (derived-mode-p 'hord-agenda-mode)
+      (hord-agenda-mode))
+    (setq hord-agenda--range "week")
+    (setq hord-agenda--filter nil)
+    (hord-agenda--update)))
+
+(defun hord-agenda-refresh ()
+  "Reload hord data and refresh the agenda."
+  (interactive)
+  (hord--load (expand-file-name hord-root))
+  (hord-agenda--update))
+
+(defun hord-agenda-week ()
+  "Show agenda for the coming week."
+  (interactive)
+  (setq hord-agenda--range "week")
+  (hord-agenda--update))
+
+(defun hord-agenda-month ()
+  "Show agenda for the coming month."
+  (interactive)
+  (setq hord-agenda--range "month")
+  (hord-agenda--update))
+
+(defun hord-agenda-toggle-all ()
+  "Toggle showing done/waiting/delegated items."
+  (interactive)
+  (setq hord-agenda--show-all (not hord-agenda--show-all))
+  (hord-agenda--update)
+  (message "Showing %s items" (if hord-agenda--show-all "all" "active")))
+
+(defun hord-agenda-filter ()
+  "Set a text filter on agenda items."
+  (interactive)
+  (setq hord-agenda--filter
+        (let ((input (read-string "Agenda filter: "
+                                  (or hord-agenda--filter ""))))
+          (if (string-empty-p input) nil input)))
+  (hord-agenda--update))
+
+(defun hord-agenda-open ()
+  "Open the card at point in hord-view."
+  (interactive)
+  (let ((uuid (tabulated-list-get-id)))
+    (when uuid
+      (let ((buf (get-buffer-create "*hord*")))
+        (with-current-buffer buf
+          (unless (eq major-mode 'hord-card-mode)
+            (hord-card-mode))
+          (hord--render-card uuid))
+        (switch-to-buffer-other-window buf)))))
+
+(defun hord-agenda-view-card ()
+  "View card detail at point."
+  (interactive)
+  (hord-agenda-open))
+
+(defun hord-agenda-edit ()
+  "Edit the source org file for the card at point."
+  (interactive)
+  (let* ((uuid (tabulated-list-get-id))
+         (path (when uuid (gethash uuid hord--index))))
+    (if path
+        (find-file (expand-file-name path (expand-file-name hord-root)))
+      (message "No source file for this card"))))
+
+(defun hord-agenda-mark-done ()
+  "Mark the task at point as done.
+Updates the status in the source org file and recompiles."
+  (interactive)
+  (let* ((uuid (tabulated-list-get-id))
+         (path (when uuid (gethash uuid hord--index)))
+         (filepath (when path
+                     (expand-file-name path (expand-file-name hord-root)))))
+    (unless filepath
+      (user-error "No source file for this card"))
+    (with-current-buffer (find-file-noselect filepath)
+      (save-excursion
+        (goto-char (point-min))
+        (cond
+         ;; Existing STATUS line — replace value
+         ((re-search-forward "^\\(\\s-*:STATUS:\\s-+\\).*" nil t)
+          (replace-match "\\1done"))
+         ;; No STATUS — insert after :PROPERTIES:
+         ((progn (goto-char (point-min))
+                 (re-search-forward "^\\(\\s-*\\):PROPERTIES:" nil t))
+          (let ((indent (match-string 1)))
+            (forward-line 1)
+            (insert indent ":STATUS:  done\n")))
+         (t (user-error "Cannot find properties block"))))
+      (save-buffer))
+    ;; Update in-memory state
+    (puthash uuid "done" hord--statuses)
+    (hord-agenda--update)
+    (message "Marked done: %s" (gethash uuid hord--titles "(untitled)"))))
+
+;; ── Triage ───────────────────────────────────────────────
+
+(defcustom hord-gtask-credentials-file
+  "~/proj/gtasks-mcp/.gtasks-server-credentials.json"
+  "Path to the Google Tasks OAuth credentials file."
+  :type 'file
+  :group 'hord)
+
+(defcustom hord-gtask-oauth-keys-file
+  "~/proj/gtasks-mcp/gcp-oauth.keys.json"
+  "Path to the Google OAuth client keys file."
+  :type 'file
+  :group 'hord)
+
+(defcustom hord-gtask-list-id
+  "MTU0Nzg1NzkwNTQ4MzYzMDQ5MzI6MDow"
+  "Google Tasks list ID to create tasks in."
+  :type 'string
+  :group 'hord)
+
+(defun hord-triage--heading-title ()
+  "Get the cleaned title from the org heading at point."
+  (save-excursion
+    (org-back-to-heading t)
+    (let ((title (org-get-heading t t t t)))
+      (string-trim
+       (replace-regexp-in-string "\\`\\(TODO\\|DONE\\|NEXT\\)\\s-+" "" title)))))
+
+(defun hord-triage--read-due-date ()
+  "Prompt for a due date using org's date picker."
+  (format-time-string "%Y-%m-%d"
+                      (org-read-date nil t nil "Due date: ")))
+
+(defun hord-triage--heading-body ()
+  "Get the body text under the current heading (excluding subheadings)."
+  (save-excursion
+    (org-back-to-heading t)
+    (forward-line 1)
+    (let ((beg (point))
+          (end (save-excursion
+                 (outline-next-heading)
+                 (point))))
+      (string-trim
+       (buffer-substring-no-properties beg end)))))
+
+;;;###autoload
+(defun hord-triage-to-task ()
+  "Create a hord task card from the heading at point.
+Prompts for due date and status, creates a capture card,
+and compiles it into the quad store."
+  (interactive)
+  (let* ((title (hord-triage--heading-title))
+         (due (hord-triage--read-due-date))
+         (status (completing-read "Status: "
+                                  '("todo" "next" "waiting" "delegated") nil nil nil nil "todo"))
+         (body (hord-triage--heading-body))
+         (default-directory (expand-file-name hord-root)))
+    ;; Create the card scaffold
+    (let ((output (shell-command-to-string
+                   (format "hord new %s -t cap -d capture/ 2>&1"
+                           (shell-quote-argument title)))))
+      ;; Find the newly created file and add STATUS + DUE
+      (let* ((filename (hord-triage--find-new-file title))
+             (filepath (when filename
+                         (expand-file-name filename
+                                           (expand-file-name hord-root)))))
+        (when filepath
+          (with-current-buffer (find-file-noselect filepath)
+            (goto-char (point-min))
+            (when (re-search-forward "^\\(\\s-*\\):END:" nil t)
+              (let ((indent (match-string 1)))
+                (beginning-of-line)
+                (insert indent ":STATUS:  " status "\n")
+                (insert indent ":DUE:     " due "\n")))
+            (save-buffer)
+            (kill-buffer)))
+        ;; Compile to update quads
+        (shell-command-to-string "hord compile 2>&1")
+        ;; Reload in-memory data
+        (hord--load (expand-file-name hord-root))
+        (message "Task created: %s [%s] (due %s)" title status due)))))
+
+(defun hord-triage--find-new-file (title)
+  "Find the capture file for TITLE by converting to the hord filename format."
+  (let* ((sanitized (replace-regexp-in-string "[^a-zA-Z0-9_ ]" "" title))
+         (underscored (replace-regexp-in-string "\\s-+" "_" (string-trim sanitized)))
+         (truncated (if (> (length underscored) 60)
+                        (substring underscored 0 60)
+                      underscored))
+         (filename (concat "capture/" truncated "--14.org")))
+    (if (file-exists-p (expand-file-name filename (expand-file-name hord-root)))
+        filename
+      ;; Fallback: find most recent file in capture/
+      (let* ((dir (expand-file-name "capture/" (expand-file-name hord-root)))
+             (files (directory-files dir nil "\\.org\\'" t)))
+        (when files
+          (concat "capture/" (car (last (sort files #'string<)))))))))
+
+;;;###autoload
+(defun hord-triage-to-gtask ()
+  "Create a Google Task from the heading at point.
+Prompts for due date, creates the task via Google Tasks API."
+  (interactive)
+  (let* ((title (hord-triage--heading-title))
+         (due (hord-triage--read-due-date))
+         (body (hord-triage--heading-body))
+         (token (hord-gtask--access-token))
+         (url (format "https://tasks.googleapis.com/tasks/v1/lists/%s/tasks"
+                      hord-gtask-list-id))
+         (url-request-method "POST")
+         (url-request-extra-headers
+          `(("Authorization" . ,(concat "Bearer " token))
+            ("Content-Type" . "application/json")))
+         (payload (json-encode
+                   `((title . ,title)
+                     (notes . ,(if (string-empty-p body) nil body))
+                     (due . ,(concat due "T00:00:00.000Z")))))
+         (url-request-data payload))
+    (with-current-buffer (url-retrieve-synchronously url t)
+      (goto-char url-http-end-of-headers)
+      (let ((response (json-read)))
+        (if (assq 'title response)
+            (message "Google Task created: %s (due %s)" title due)
+          (message "Error creating task: %s" response))))))
+
+(defun hord-gtask--access-token ()
+  "Get a valid Google Tasks access token, refreshing if needed."
+  (let* ((creds-file (expand-file-name hord-gtask-credentials-file))
+         (creds (json-read-file creds-file))
+         (expiry (cdr (assq 'expiry_date creds)))
+         (now-ms (* 1000 (float-time))))
+    (if (and expiry (< now-ms (- expiry 60000)))
+        ;; Token still valid
+        (cdr (assq 'access_token creds))
+      ;; Need to refresh
+      (hord-gtask--refresh-token creds creds-file))))
+
+(defun hord-gtask--refresh-token (creds creds-file)
+  "Refresh the OAuth token using CREDS, save to CREDS-FILE."
+  (let* ((keys-file (expand-file-name hord-gtask-oauth-keys-file))
+         (keys-json (json-read-file keys-file))
+         (installed (cdr (assq 'installed keys-json)))
+         (client-id (cdr (assq 'client_id installed)))
+         (client-secret (cdr (assq 'client_secret installed)))
+         (refresh-token (cdr (assq 'refresh_token creds)))
+         (url-request-method "POST")
+         (url-request-extra-headers
+          '(("Content-Type" . "application/x-www-form-urlencoded")))
+         (url-request-data
+          (format "client_id=%s&client_secret=%s&refresh_token=%s&grant_type=refresh_token"
+                  (url-hexify-string client-id)
+                  (url-hexify-string client-secret)
+                  (url-hexify-string refresh-token))))
+    (with-current-buffer
+        (url-retrieve-synchronously "https://oauth2.googleapis.com/token" t)
+      (goto-char url-http-end-of-headers)
+      (let* ((response (json-read))
+             (new-token (cdr (assq 'access_token response)))
+             (expires-in (cdr (assq 'expires_in response))))
+        (unless new-token
+          (error "Token refresh failed: %s" response))
+        ;; Update saved credentials
+        (setcdr (assq 'access_token creds) new-token)
+        (setcdr (assq 'expiry_date creds)
+                (+ (* 1000 (float-time)) (* 1000 expires-in)))
+        (with-temp-file creds-file
+          (insert (json-encode creds)))
+        new-token))))
+
 ;; ── Keybinding ────────────────────────────────────────────
 
 ;;;###autoload
@@ -1800,6 +2357,15 @@ Writes directly to the current org buffer and saves."
 
 ;;;###autoload
 (global-set-key (kbd "C-c W S") #'hord-scratch-list)
+
+;;;###autoload
+(global-set-key (kbd "C-c W A") #'hord-agenda)
+
+;;;###autoload
+(global-set-key (kbd "C-c W t") #'hord-triage-to-task)
+
+;;;###autoload
+(global-set-key (kbd "C-c W T") #'hord-triage-to-gtask)
 
 (provide 'hord)
 ;;; hord.el ends here
