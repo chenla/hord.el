@@ -73,7 +73,14 @@ opened in Emacs (e.g. md, org, txt)."
     ("wh:evt" . "Event")
     ("wh:obj" . "Object")
     ("wh:org" . "Organization")
-    ("wh:cap" . "Capture"))
+    ("wh:cap" . "Capture")
+    ("wh:tag" . "Tag")
+    ("wh:persona" . "Persona")
+    ("wh:office" . "Office")
+    ("wh:task" . "Task")
+    ("wh:event" . "Event")
+    ("wh:media" . "Media")
+    ("wh:holon" . "Holon"))
   "Mapping from vocab type IDs to human-readable labels."
   :type '(alist :key-type string :value-type string)
   :group 'hord)
@@ -102,7 +109,11 @@ opened in Emacs (e.g. md, org, txt)."
     ("v:s-eo" . "Expr")
     ("v:s-mo" . "Manif")
     ("v:s-io" . "Inst")
-    ("v:s-type" . "WEMI"))
+    ("v:s-type" . "WEMI")
+    ("v:h-member" . "Member")
+    ("v:h-expr" . "Expr")
+    ("v:h-order" . "Order")
+    ("v:h-cascade" . "Cascade"))
   "Mapping from vocab predicate IDs to display labels."
   :type '(alist :key-type string :value-type string)
   :group 'hord)
@@ -259,7 +270,9 @@ OVERLAY-NAME is used to route persona annotations to the right table."
   (with-temp-buffer
     (insert-file-contents filepath)
     (forward-line 1) ; skip header
-    (let (uuid quads
+    (let ((file-uuid (file-name-sans-extension
+                      (file-name-nondirectory filepath)))
+          (per-subject (make-hash-table :test 'equal))
           (persona (when (and overlay-name
                               (string-prefix-p "persona-" overlay-name))
                      (substring overlay-name 8))))
@@ -271,8 +284,9 @@ OVERLAY-NAME is used to route persona annotations to the right table."
                   (p (match-string 2 line))
                   (o (match-string 3 line))
                   (c (match-string 4 line)))
-              (setq uuid s)
-              (push (make-hord-quad :subject s :predicate p :object o :context c) quads)
+              (let ((q (make-hord-quad :subject s :predicate p :object o :context c)))
+                ;; Group quads by their actual subject
+                (puthash s (cons q (gethash s per-subject nil)) per-subject))
               ;; Index title and type
               (cond
                ((string= p "v:title")
@@ -306,11 +320,12 @@ OVERLAY-NAME is used to route persona annotations to the right table."
                 (push (cons p s)
                       (gethash o hord--incoming nil))))))
         (forward-line 1))
-      (when uuid
-        ;; Merge quads (overlays add to same entity)
-        (puthash uuid (append (gethash uuid hord--quads nil)
-                              (nreverse quads))
-                 hord--quads)))))
+      ;; Merge quads into main store, grouped by actual subject UUID
+      (maphash (lambda (uuid quads)
+                 (puthash uuid (append (gethash uuid hord--quads nil)
+                                       (nreverse quads))
+                          hord--quads))
+               per-subject))))
 
 (defun hord--build-citekey-index (root)
   "Build citekey → UUID index by scanning org files for :CITEKEY: properties."
@@ -2366,6 +2381,213 @@ Prompts for due date, creates the task via Google Tasks API."
 
 ;;;###autoload
 (global-set-key (kbd "C-c W T") #'hord-triage-to-gtask)
+
+;; ── Holon view ───────────────────────────────────────────
+
+(defvar-local hord-holon--uuid nil
+  "UUID of the holon currently displayed.")
+
+(defun hord-holon--find-holons ()
+  "Return alist of (title . uuid) for all wh:holon cards."
+  (hord--ensure-loaded)
+  (let (holons)
+    (maphash (lambda (uuid type)
+               (when (string= type "wh:holon")
+                 (let ((title (gethash uuid hord--titles uuid)))
+                   (push (cons title uuid) holons))))
+             hord--types)
+    (sort holons (lambda (a b) (string< (car a) (car b))))))
+
+(defun hord-holon--members (holon-uuid)
+  "Return list of member UUIDs for HOLON-UUID."
+  (let ((quads (gethash holon-uuid hord--quads))
+        members)
+    (dolist (q quads)
+      (when (string= (hord-quad-predicate q) "v:h-member")
+        (push (hord-quad-object q) members)))
+    (nreverse members)))
+
+(defun hord-holon--expr-prefer (holon-uuid)
+  "Return the expression preference tag for HOLON-UUID, or nil."
+  (let ((quads (gethash holon-uuid hord--quads)))
+    (cl-loop for q in quads
+             when (string= (hord-quad-predicate q) "v:h-expr")
+             return (hord-quad-object q))))
+
+(defun hord-holon--order-map (holon-uuid)
+  "Return hash table mapping member UUID → order position for HOLON-UUID.
+Order quads have subject=member UUID and context=holon UUID,
+so we read from each member's quads."
+  (let ((members (hord-holon--members holon-uuid))
+        (order (make-hash-table :test #'equal)))
+    (dolist (m-uuid members)
+      (dolist (q (gethash m-uuid hord--quads))
+        (when (and (string= (hord-quad-predicate q) "v:h-order")
+                   (string= (hord-quad-context q) holon-uuid))
+          (puthash m-uuid
+                   (string-to-number (hord-quad-object q))
+                   order))))
+    order))
+
+(defun hord-holon--find-expression (whole-uuid expr-tag)
+  "Find expression card UUID for WHOLE-UUID matching EXPR-TAG."
+  (let (result)
+    ;; Scan all quads for v:s-eo pointing to whole-uuid
+    (maphash (lambda (uuid quads)
+               (unless result
+                 (let ((is-expr nil)
+                       (has-tag nil))
+                   (dolist (q quads)
+                     (when (and (string= (hord-quad-predicate q) "v:s-eo")
+                                (string= (hord-quad-object q) whole-uuid))
+                       (setq is-expr t))
+                     (when (and (string= (hord-quad-predicate q) "v:tag")
+                                (string= (hord-quad-object q) expr-tag))
+                       (setq has-tag t)))
+                   (when (and is-expr has-tag)
+                     (setq result uuid)))))
+             hord--quads)
+    result))
+
+(defun hord-holon--render (holon-uuid)
+  "Render a holon view for HOLON-UUID in the current buffer."
+  (let* ((title (gethash holon-uuid hord--titles holon-uuid))
+         (members (hord-holon--members holon-uuid))
+         (expr-tag (hord-holon--expr-prefer holon-uuid))
+         (order-map (hord-holon--order-map holon-uuid))
+         (inhibit-read-only t)
+         ;; Build (position . (uuid . expr-uuid)) list
+         (entries nil))
+
+    ;; Resolve members with ordering and expression substitution
+    (dolist (m-uuid members)
+      (let ((pos (gethash m-uuid order-map 999))
+            (expr-uuid (when expr-tag
+                         (hord-holon--find-expression m-uuid expr-tag))))
+        (push (list pos m-uuid expr-uuid) entries)))
+    (setq entries (sort entries (lambda (a b) (< (car a) (car b)))))
+
+    (erase-buffer)
+    (setq hord-holon--uuid holon-uuid)
+
+    ;; Header
+    (insert (propertize (format " Holon: %s " title)
+                        'face 'hord-title)
+            "\n")
+    (insert (make-string 56 ?─) "\n")
+    (when expr-tag
+      (hord--insert-meta "Expression" expr-tag))
+    (hord--insert-meta "Members" (format "%d" (length members)))
+    (insert "\n")
+
+    ;; Member list
+    (insert (propertize "── Members " 'face 'hord-section-header)
+            (propertize (make-string 45 ?─) 'face 'hord-section-header)
+            "\n\n")
+
+    (dolist (entry entries)
+      (let* ((pos (nth 0 entry))
+             (m-uuid (nth 1 entry))
+             (expr-uuid (nth 2 entry))
+             (m-title (gethash m-uuid hord--titles m-uuid))
+             (m-type (gethash m-uuid hord--types "?"))
+             (type-label (hord--type-label m-type))
+             (display-uuid (or expr-uuid m-uuid))
+             (display-title (if expr-uuid
+                                (gethash expr-uuid hord--titles m-title)
+                              m-title)))
+        (insert (propertize (format " %3d. " pos) 'face 'hord-metadata-key))
+        (insert (propertize (format "[%-12s] " type-label)
+                            'face 'hord-relation-type))
+        (hord--insert-link display-uuid display-title)
+        (when expr-uuid
+          (insert (propertize "  ← " 'face 'hord-incoming-source))
+          (hord--insert-link m-uuid "Whole"))
+        (insert "\n")))
+
+    (insert "\n")
+
+    ;; Footer: edit holon definition
+    (insert (propertize "── Holon Definition " 'face 'hord-section-header)
+            (propertize (make-string 36 ?─) 'face 'hord-section-header)
+            "\n  ")
+    (let ((filepath (gethash holon-uuid hord--index)))
+      (when filepath
+        (insert-text-button
+         "Edit holon card"
+         'face 'hord-link
+         'action (lambda (_btn)
+                   (find-file (expand-file-name filepath hord-root)))
+         'follow-link t)))
+    (insert "\n")
+
+    (goto-char (point-min))))
+
+;; ── Holon view mode ──────────────────────────────────────
+
+(defvar hord-holon-mode-map
+  (let ((map (make-sparse-keymap)))
+    (define-key map (kbd "RET") #'hord-follow-link)
+    (define-key map (kbd "b")   #'hord-back)
+    (define-key map (kbd "e")   #'hord-holon-edit)
+    (define-key map (kbd "l")   #'hord-list)
+    (define-key map (kbd "g")   #'hord-holon-refresh)
+    (define-key map (kbd "q")   #'hord-quit)
+    (define-key map (kbd "TAB") #'forward-button)
+    (define-key map (kbd "<backtab>") #'backward-button)
+    map)
+  "Keymap for `hord-holon-mode'.")
+
+(define-derived-mode hord-holon-mode special-mode "Hord-Holon"
+  "Major mode for viewing Hoard holons.
+\\{hord-holon-mode-map}"
+  (setq-local revert-buffer-function
+              (lambda (_ignore-auto _noconfirm)
+                (hord-holon-refresh))))
+
+(defun hord-holon-edit ()
+  "Edit the holon definition card."
+  (interactive)
+  (when hord-holon--uuid
+    (let ((filepath (gethash hord-holon--uuid hord--index)))
+      (when filepath
+        (find-file (expand-file-name filepath hord-root))))))
+
+(defun hord-holon-refresh ()
+  "Refresh the current holon view."
+  (interactive)
+  (when hord-holon--uuid
+    (hord-holon--render hord-holon--uuid)))
+
+;;;###autoload
+(defun hord-holon-open (uuid)
+  "Open a holon view for UUID."
+  (interactive
+   (list (let* ((holons (hord-holon--find-holons))
+                (choice (completing-read "Holon: " holons nil t)))
+           (cdr (assoc choice holons)))))
+  (hord--ensure-loaded)
+  (let ((buf (get-buffer-create (format "*hord-holon: %s*"
+                                        (gethash uuid hord--titles uuid)))))
+    (with-current-buffer buf
+      (hord-holon-mode)
+      (hord-holon--render uuid))
+    (switch-to-buffer buf)))
+
+;;;###autoload
+(defun hord-holon ()
+  "Browse holons — select from a list and open."
+  (interactive)
+  (hord--ensure-loaded)
+  (let ((holons (hord-holon--find-holons)))
+    (if (null holons)
+        (message "No holons found in this hord.")
+      (let* ((choice (completing-read "Holon: " holons nil t))
+             (uuid (cdr (assoc choice holons))))
+        (hord-holon-open uuid)))))
+
+;;;###autoload
+(global-set-key (kbd "C-c W H") #'hord-holon)
 
 (provide 'hord)
 ;;; hord.el ends here
