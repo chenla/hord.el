@@ -49,6 +49,15 @@
   :type 'directory
   :group 'hord)
 
+(defcustom hord-roots
+  '(("word-hord"    . "~/proj/hord/")
+    ("screed-hord"  . "~/proj/ybr/screed-hord/")
+    ("solvay-1927"  . "~/proj/hoard/examples/solvay-1927/"))
+  "Alist of known hords: (NAME . DIRECTORY).
+Used by `hord-switch' to toggle between hords."
+  :type '(alist :key-type string :value-type directory)
+  :group 'hord)
+
 (defcustom hord-external-viewers
   '(("pdf"  . "okular")
     ("epub" . "xdg-open")
@@ -2588,6 +2597,32 @@ so we read from each member's quads."
 
 ;;;###autoload
 (global-set-key (kbd "C-c W H") #'hord-holon)
+
+;; ── Switch between hords ─────────────────────────────────
+
+(defun hord--current-name ()
+  "Return the name of the current hord from `hord-roots', or the path."
+  (let ((root (expand-file-name hord-root)))
+    (or (car (cl-rassoc root hord-roots
+                        :test (lambda (a b) (string= a (expand-file-name b)))))
+        root)))
+
+;;;###autoload
+(defun hord-switch ()
+  "Switch to a different hord from `hord-roots'."
+  (interactive)
+  (let* ((names (mapcar #'car hord-roots))
+         (current (hord--current-name))
+         (choice (completing-read
+                  (format "Switch hord (current: %s): " current)
+                  names nil t)))
+    (setq hord-root (cdr (assoc choice hord-roots)))
+    (setq hord--loaded-root nil)  ; force reload
+    (hord--ensure-loaded)
+    (message "Switched to %s (%s)" choice hord-root)))
+
+;;;###autoload
+(global-set-key (kbd "C-c W s") #'hord-switch)
 
 (provide 'hord)
 ;;; hord.el ends here
