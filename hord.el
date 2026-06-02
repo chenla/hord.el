@@ -1615,27 +1615,46 @@ Works from any buffer (org-mode, hord reader, etc.)."
            "#+TITLE: Scratch — %A %e %B %Y\n\n** " date))
   (save-buffer))
 
-(defvar hord-scratch--inbox-last-size 0
-  "Byte size of inbox file at last import.
-Used to detect new content without clearing the file
-\(since one-way Syncthing means the phone will overwrite
-any clears\).")
+(defvar hord-scratch--inbox-state-file
+  (expand-file-name ".inbox-state" "~/proj/ybr/bench/scratch/inbox/")
+  "File storing the last-imported byte offset of the mobile inbox.
+Persists across Emacs sessions so imports resume correctly.")
+
+(defun hord-scratch--inbox-read-state ()
+  "Read the last-imported byte offset from the state file.
+Returns 0 if the state file doesn't exist or is unreadable."
+  (let ((f (expand-file-name hord-scratch--inbox-state-file)))
+    (if (file-exists-p f)
+        (condition-case nil
+            (string-to-number
+             (string-trim
+              (with-temp-buffer
+                (insert-file-contents f)
+                (buffer-string))))
+          (error 0))
+      0)))
+
+(defun hord-scratch--inbox-write-state (size)
+  "Write SIZE as the last-imported byte offset to the state file."
+  (let ((f (expand-file-name hord-scratch--inbox-state-file)))
+    (with-temp-file f
+      (insert (number-to-string size)))))
 
 (defun hord-scratch--import-inbox ()
   "Import new items from mobile inbox into current scratch buffer.
 Only imports content added since the last import, tracked by file
-size.  Does not clear the inbox file (phone is send-only and would
-overwrite any clears)."
+size persisted in .inbox-state.  Does not clear the inbox file
+\(phone is send-only and would overwrite any clears\)."
   (let* ((inbox (expand-file-name hord-scratch-inbox-file))
          (size (and (file-exists-p inbox)
-                    (file-attribute-size (file-attributes inbox)))))
-    (when (and size (> size hord-scratch--inbox-last-size))
+                    (file-attribute-size (file-attributes inbox))))
+         (last-size (hord-scratch--inbox-read-state)))
+    (when (and size (> size last-size))
       (let ((content (with-temp-buffer
                        (insert-file-contents inbox nil
-                                            hord-scratch--inbox-last-size size)
+                                            last-size size)
                        (string-trim (buffer-string)))))
         (when (not (string-empty-p content))
-          ;; Append to scratch
           (goto-char (point-max))
           (unless (bolp) (insert "\n"))
           (insert "\n** Mobile inbox ["
@@ -1644,8 +1663,8 @@ overwrite any clears)."
                   content "\n")
           (save-buffer)
           (message "Imported %d bytes from mobile inbox"
-                   (- size hord-scratch--inbox-last-size))))
-      (setq hord-scratch--inbox-last-size size))))
+                   (- size last-size))))
+      (hord-scratch--inbox-write-state size))))
 
 (defun hord-scratch--import-readwise ()
   "Import new Readwise highlights into current scratch buffer.
@@ -2622,7 +2641,53 @@ so we read from each member's quads."
     (message "Switched to %s (%s)" choice hord-root)))
 
 ;;;###autoload
-(global-set-key (kbd "C-c W s") #'hord-switch)
+(global-set-key (kbd "C-c W W") #'hord-switch)
+
+;; ── idx: link type — inline keyword index ───────────────
+
+(defface hord-idx-face
+  '((t :inherit default :underline (:style line :color "gray70")))
+  "Face for idx: links — subtle underline, otherwise plain text."
+  :group 'hord)
+
+(defun hord-idx-follow (term)
+  "Follow an idx: link by searching the hord for TERM.
+Tries exact title match first, then fuzzy completing-read."
+  (hord--ensure-loaded)
+  (let* ((entities (hord--all-entities))
+         (match (cl-find-if
+                 (lambda (e)
+                   (string-equal-ignore-case (nth 1 e) term))
+                 entities)))
+    (if match
+        (hord-open (nth 0 match))
+      ;; No exact match — fuzzy search with term as initial input
+      (let* ((candidates (mapcar
+                          (lambda (e)
+                            (cons (format "%-12s %s"
+                                          (hord--type-label (nth 2 e))
+                                          (nth 1 e))
+                                  (nth 0 e)))
+                          entities))
+             (choice (completing-read
+                      (format "idx \"%s\" — find card: " term)
+                      candidates nil t term))
+             (uuid (cdr (assoc choice candidates))))
+        (when uuid
+          (hord-open uuid))))))
+
+(defun hord-idx-export (term _desc backend _info)
+  "Export an idx: link — plain text in all backends."
+  (pcase backend
+    ('html (format "<span class=\"idx\" data-term=\"%s\">%s</span>"
+                   (org-html-encode-plain-text term)
+                   (org-html-encode-plain-text term)))
+    (_ term)))
+
+(org-link-set-parameters "idx"
+  :follow #'hord-idx-follow
+  :export #'hord-idx-export
+  :face 'hord-idx-face)
 
 (provide 'hord)
 ;;; hord.el ends here
