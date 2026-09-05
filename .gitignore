@@ -1,3 +1,7 @@
 *.elc
 *-autoloads.el
 *-pkg.el
+
+# Python bytecode from the bundled gcal-fetch helper
+__pycache__/
+*.pyc
