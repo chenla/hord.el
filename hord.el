@@ -1649,6 +1649,10 @@ size persisted in .inbox-state.  Does not clear the inbox file
          (size (and (file-exists-p inbox)
                     (file-attribute-size (file-attributes inbox))))
          (last-size (hord-scratch--inbox-read-state)))
+    ;; A file smaller than the saved offset was trimmed or replaced
+    ;; (a new phone, or edits in Markor): start over from the top.
+    (when (and size (< size last-size))
+      (setq last-size 0))
     (when (and size (> size last-size))
       (let ((content (with-temp-buffer
                        (insert-file-contents inbox nil
