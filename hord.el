@@ -1612,7 +1612,7 @@ Works from any buffer (org-mode, hord reader, etc.)."
 (defun hord-scratch--init-buffer (file date)
   "Insert the header template into FILE for DATE."
   (insert (format-time-string
-           "#+TITLE: Scratch — %A %e %B %Y\n\n** " date))
+           "#+STARTUP: showall\n#+TITLE: Scratch — %A %e %B %Y\n\n** " date))
   (save-buffer))
 
 (defvar hord-scratch--inbox-state-file
@@ -1723,7 +1723,7 @@ any pending items from the Orgzly inbox and new Readwise highlights."
     (unless (file-exists-p file)
       (with-temp-file file
         (insert (format-time-string
-                 "#+TITLE: Scratch — %A %e %B %Y\n\n" tomorrow))))
+                 "#+STARTUP: showall\n#+TITLE: Scratch — %A %e %B %Y\n\n" tomorrow))))
     ;; Append the text
     (with-current-buffer (find-file-noselect file)
       (goto-char (point-max))
