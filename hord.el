@@ -1640,25 +1640,56 @@ Returns 0 if the state file doesn't exist or is unreadable."
     (with-temp-file f
       (insert (number-to-string size)))))
 
+(defvar hord-scratch--inbox-snapshot-file
+  (expand-file-name ".inbox-last" "~/proj/ybr/bench/scratch/")
+  "The mobile inbox as it stood at the last import.
+Kept outside the synced folder so Syncthing never sends it back.")
+
+(defun hord-scratch--read-utf8 (file &optional end)
+  "FILE's text as UTF-8, or nil if it doesn't exist.
+With END, only its first END bytes, cut back to the last whole line."
+  (when (file-exists-p file)
+    (with-temp-buffer
+      (let ((coding-system-for-read 'utf-8))
+        (insert-file-contents file nil 0 end))
+      (when end
+        (goto-char (point-max))
+        (delete-region (line-beginning-position) (point-max)))
+      (buffer-string))))
+
+(defun hord-scratch--inbox-new-text (old new)
+  "The part of NEW, the inbox now, not in OLD, the inbox as last imported.
+Text appended at the end comes back on its own.  If the phone changed
+something earlier in the file, everything from the first changed line
+on comes back: an edit may repeat a little that was imported before,
+but nothing new is ever skipped."
+  (if (string-prefix-p old new)
+      (substring new (length old))
+    (let ((ol (split-string old "\n"))
+          (nl (split-string new "\n")))
+      (while (and ol nl (string= (car ol) (car nl)))
+        (pop ol)
+        (pop nl))
+      (mapconcat #'identity nl "\n"))))
+
 (defun hord-scratch--import-inbox ()
   "Import new items from mobile inbox into current scratch buffer.
-Only imports content added since the last import, tracked by file
-size persisted in .inbox-state.  Does not clear the inbox file
-\(phone is send-only and would overwrite any clears\)."
+Compares the inbox with a snapshot of it taken at the last import
+\(see `hord-scratch--inbox-new-text').  It used to keep only a byte
+offset, which cut characters in half and skipped notes whenever the
+file was edited in Markor rather than appended to.  Does not clear the
+inbox file \(phone is send-only and would overwrite any clears\)."
   (let* ((inbox (expand-file-name hord-scratch-inbox-file))
-         (size (and (file-exists-p inbox)
-                    (file-attribute-size (file-attributes inbox))))
-         (last-size (hord-scratch--inbox-read-state)))
-    ;; A file smaller than the saved offset was trimmed or replaced
-    ;; (a new phone, or edits in Markor): start over from the top.
-    (when (and size (< size last-size))
-      (setq last-size 0))
-    (when (and size (> size last-size))
-      (let ((content (with-temp-buffer
-                       (insert-file-contents inbox nil
-                                            last-size size)
-                       (string-trim (buffer-string)))))
-        (when (not (string-empty-p content))
+         (snap (expand-file-name hord-scratch--inbox-snapshot-file))
+         (new (hord-scratch--read-utf8 inbox)))
+    (when new
+      (let* ((old (or (hord-scratch--read-utf8 snap)
+                      ;; first run since the change: start from the old
+                      ;; byte offset, cut back to a whole line
+                      (let ((n (hord-scratch--inbox-read-state)))
+                        (if (> n 0) (hord-scratch--read-utf8 inbox n) ""))))
+             (content (string-trim (hord-scratch--inbox-new-text old new))))
+        (unless (string-empty-p content)
           (goto-char (point-max))
           (unless (bolp) (insert "\n"))
           (insert "\n** Mobile inbox ["
@@ -1666,9 +1697,12 @@ size persisted in .inbox-state.  Does not clear the inbox file
                   "]\n\n"
                   content "\n")
           (save-buffer)
-          (message "Imported %d bytes from mobile inbox"
-                   (- size last-size))))
-      (hord-scratch--inbox-write-state size))))
+          (message "Imported %d characters from mobile inbox"
+                   (length content)))
+        (let ((coding-system-for-write 'utf-8))
+          (write-region new nil snap nil 'silent))
+        (hord-scratch--inbox-write-state
+         (file-attribute-size (file-attributes inbox)))))))
 
 (defun hord-scratch--import-readwise ()
   "Import new Readwise highlights into current scratch buffer.
